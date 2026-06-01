@@ -1,0 +1,21 @@
+# Boltz-2 ``predict`` input header. Only the ``version`` line is read by
+# ``utils/write_boltz2_yamls.py``; the ``sequences`` block is generated:
+#   - chain ``A`` = binder (design) sequence;
+#   - chains ``B``, ``C``, … = target / epitope segments split on ``:`` (chain
+#     breaks in the epitope FASTA or after the first ``:`` on a combined line).
+#
+# Example (two target segments → ``B`` and ``C``):
+#
+#   version: 1
+#   sequences:
+#     - protein:
+#         id: A
+#         sequence: MTEEELLAEEAAQRAAALLEAGDFEAARELAREAAEKLRSEEVRRELLERFEELLAAAR
+#     - protein:
+#         id: B
+#         sequence: NATLAVEKEGCPVCITVNTTI
+#     - protein:
+#         id: C
+#         sequence: VRFESIRLPGCPRGVNPVVSYAVA
+
+version: 1

@@ -1,0 +1,52 @@
+rfdiffusion:
+  docker_image: rfdiffusion
+  gpus: 1,2
+  outputs_dir: /storage/hCG/rfdiffusion/outputs
+  rfdiffusion_models_host: /storage/proteindesign/RFdiffusion/models
+  model_directory_path: /storage/proteindesign/RFdiffusion/models
+  extra_hydra_args: []
+proteinmpnn:
+  docker_image: rosettacommons/proteinmpnn
+  gpus: 1,2
+  chain_list: A
+  num_seq_per_target: 5
+  fixed_positions_jsonl: ''
+  omit_AAs: X
+  sampling_temp: '0.1'
+  use_soluble_model: true
+  extra_args: []
+boltz2:
+  template_yaml: /storage/proteindesign/dagster_pipeline/dagster_pipeline/default_boltz2_template.yaml
+  docker_image: boltz2
+  gpus: 1,2
+  cache_volume: boltz2-cache
+  use_msa_server: true
+  use_potentials: false
+  override: false
+  recycling_steps: 3
+  devices: 1
+  diffusion_samples: 1
+  num_workers: 0
+  no_kernels: true
+  query_chunk_size: 10
+colabfold:
+  target_epitope_fasta: /storage/hCG/loops_epitope_target.fasta
+  fasta_extensions:
+  - .fa
+  - .fasta
+  - .faa
+  gpus: 1,2
+  model_type: alphafold2_multimer_v3
+  pair_mode: unpaired_paired
+  num_models: 5
+  num_recycle: 3
+  num_relax: 0
+  query_chunk_size: 10
+  colabfold_image: ghcr.io/sokrypton/colabfold:1.6.0-cuda12
+  colabfold_cache_host: /storage/proteindesign/ColabFold_cache
+  apply_alphafold_numpy_patch: true
+  extra_colabfold_args: []
+filters:
+  docker_image: proteindesign-filters
+  align_chain: B
+  rmsd_chains: A,B

@@ -1,0 +1,8 @@
+.nux
+.telemetry
+.tmp*
+history
+*egg-info
+storage
+*pycache*
+schedules
