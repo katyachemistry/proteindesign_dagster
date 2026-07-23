@@ -119,6 +119,7 @@ from utils.load_rfdiffusion_antihotspots import (  # noqa: E402
 )
 from utils.generate_promera_yamls import generate_promera_task_configs  # noqa: E402
 from utils.normalize_promera_designs import normalize_promera_designs  # noqa: E402
+from utils.import_promera_sequences import import_promera_fasta_to_mpnn_seqs  # noqa: E402
 from utils.merge_fasta import explode_fasta_records_with_append, read_fasta_sequence_flat  # noqa: E402
 from utils.import_external_sequences import import_external_fasta_to_mpnn_seqs  # noqa: E402
 from utils.soluprot_filter import (  # noqa: E402
@@ -1903,6 +1904,13 @@ def proteinmpnn_parsed(context: AssetExecutionContext):
 
     entry = _manifest_entry(context, pc)
     tool = str(entry.get("tool") or "")
+    if tool == DESIGN_TOOL_PROMERA:
+        context.log.info(
+            f"[proteinmpnn_parsed] partition={context.partition_key}  "
+            "promera partition; skipping ProteinMPNN parse (promera already "
+            "did its own AbMPNN CDR redesign — see proteinmpnn_soluprot_filter)"
+        )
+        return
     mpnn = pc.proteinmpnn
     proot = _partition_root(_run_outputs_dir(pc), context.partition_key, pc.run_id)
     pdbs_dir = proot / "pdbs_filtered"
@@ -2039,7 +2047,8 @@ def proteinmpnn_parsed(context: AssetExecutionContext):
         "to the partition's ``proteinmpnn/seqs`` directory. "
         "Uses global ``proteinmpnn.omit_AAs``, merged with ``proteinmpnn.omit_AA`` "
         "when a scaffold key appears in the partition / design name. "
-        "Skipped for ``sequence_import`` partitions."
+        "Skipped for ``sequence_import`` and ``promera`` partitions (promera's own "
+        "AbMPNN sequence is imported directly in ``proteinmpnn_soluprot_filter``)."
     ),
 )
 def proteinmpnn_sequences(
@@ -2054,6 +2063,12 @@ def proteinmpnn_sequences(
         return
 
     entry = _manifest_entry(context, pc)
+    if str(entry.get("tool") or "") == DESIGN_TOOL_PROMERA:
+        context.log.info(
+            f"[proteinmpnn_sequences] partition={context.partition_key}  "
+            "promera partition; skipping ProteinMPNN (uses its own AbMPNN sequence)"
+        )
+        return
     mpnn = pc.proteinmpnn
     omit_aas, matched_scaffold, matched_extra = resolve_omit_aas_for_names(
         mpnn.omit_AAs,
@@ -2151,6 +2166,19 @@ def proteinmpnn_soluprot_filter(
             f"[proteinmpnn_soluprot_filter] auto-importing sequences from {input_fasta}"
         )
         import_external_fasta_to_mpnn_seqs(input_fasta, seq_dir)
+    elif str(entry.get("tool") or "") == DESIGN_TOOL_PROMERA and not list_mpnn_fasta_files(
+        seq_dir, exts
+    ):
+        # ProteinMPNN never ran for promera partitions (proteinmpnn_sequences skips
+        # them) — import promera's own AbMPNN CDR-redesigned sequence per passing
+        # design instead, matching the sequence_import layout in seqs/.
+        pdbs_filtered_dir = proot / "pdbs_filtered"
+        designs_dir = _designs_dir(proot, DESIGN_TOOL_PROMERA)
+        context.log.info(
+            f"[proteinmpnn_soluprot_filter] importing promera's own sequences from "
+            f"{pdbs_filtered_dir} (design_index.json in {designs_dir})"
+        )
+        import_promera_fasta_to_mpnn_seqs(designs_dir, pdbs_filtered_dir, seq_dir)
 
     if not seq_dir.is_dir() or not list_mpnn_fasta_files(seq_dir, exts):
         raise Failure(
