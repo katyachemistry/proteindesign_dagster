@@ -310,6 +310,10 @@ class PromeraDesignSpec(BaseModel):
 
     task_config_yaml: str
     hotspots_txts_dir: str = DEFAULT_HOTSPOTS_TXTS_DIR
+    # Optional subset of hotspots_txts_dir to use (filename or hotspot-key, e.g.
+    # "hotspot_residues_loop1_loop3_set1.txt" or "loop1_loop3_set1"). Empty = all
+    # .txt files in the directory (one partition per file), same as RFdiffusion/BoltzGen.
+    hotspot_files: List[str] = Field(default_factory=list)
     target_fasta: str = DEFAULT_PROMERA_TARGET_FASTA
     # Chain id written into the generated target/*.json and into the template's
     # `epitope_chain:` / `target_chains:` scalars. Matches the hotspot file chain

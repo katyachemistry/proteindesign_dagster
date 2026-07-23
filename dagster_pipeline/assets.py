@@ -960,6 +960,7 @@ def _generate_promera_yamls(
             Path(design.target_fasta),
             design_name,
             epitope_chain=design.epitope_chain,
+            hotspot_files=design.hotspot_files or None,
         )
         anti = design.antihotspots.model_dump()
         for _hotspot_file, task_config_path, _target_dir, epitope_residues in generated:
