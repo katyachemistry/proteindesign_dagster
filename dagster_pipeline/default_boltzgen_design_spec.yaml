@@ -1,0 +1,19 @@
+entities:
+  # Designed binder (protein id C) is injected by generate_boltzgen_yamls from
+  # designs_config.binder_sequence_file (BoltzGen design-fragment syntax, e.g. 7..9).
+  - file:
+      path: /storage/hCG/hCG_no_glycans.pdb
+      include:
+        - chain:
+            id: A
+        - chain:
+            id: B
+      binding_types:
+        - chain:
+            id: A
+            not_binding: "all"
+        - chain:
+            id: B
+            # Replaced with one hotspot TXT's residues in each generated YAML.
+            binding: HOTSPOTS_FROM_TXT
+            not_binding: 1..17,28..66,80..

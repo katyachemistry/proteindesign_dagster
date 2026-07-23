@@ -1,52 +1,256 @@
+gpus: 1,2
+run_id: ''
+outputs_root: /storage/hCG/designs/runs
 rfdiffusion:
+  enabled: false
   docker_image: rfdiffusion
-  gpus: 1,2
-  outputs_dir: /storage/hCG/rfdiffusion/outputs
   rfdiffusion_models_host: /storage/proteindesign/RFdiffusion/models
   model_directory_path: /storage/proteindesign/RFdiffusion/models
   extra_hydra_args: []
+  designs_config:
+    designs_1:
+      hotspots_txts_dir: /storage/hCG/hotspots/both_loops/
+      target_pdb: /storage/hCG/glycosylated_renumbered_loops_B_chain.pdb
+      template_rfdiffusion_yaml: null
+      template_rfdiffusion_yaml_inline: |
+        # This is a TEMPLATE yaml. Some fields will be automatically replaced with actual values when the pipeline is run.
+        # These are: input_pdb and target_path (target pdb), output_prefix - generated based on info about the run, 
+        # hotspot_res - taken from txt files, scaffold_dir - directory with scaffold .pt files
+        # Per-scaffold mask_loops / sampled_* can be overridden via pipeline_config
+        # rfdiffusion.designs_config.<design>.insertions_for_scaffolds
+        # Other fields should be specified manually right here if user wants any changes from the default values,
+        # e.g. antihotspots, num_designs, mask_loops, sampled_insertion, sampled_N, sampled_C, etc.
+
+        defaults:
+          - base
+
+        inference:
+          input_pdb: /storage/hCG/truncated_renumbered_loops_B_chain.pdb
+          output_prefix: /storage/hCG/rfdiffusion/outputs/scaffold_guided__truncated_renumbered_loops__loop1_loop3_set1
+          num_designs: 10
+
+        ppi:
+          # Hotspot residues on the hCG target.
+          hotspot_res: [B20,B21,B22,B77]   # loop3_set1 — adjust as desired
+
+        # Post-RFdiffusion binder–target contact analysis (pipeline only; RFdiffusion ignores this block).
+        antihotspots:
+          enabled: true
+          contact_distance: 10.0
+          # Max fraction of configured antihotspot residues allowed when all hotspots are contacted.
+          max_antihotspot_contact_fraction: 0.25
+          # Reference target residues to monitor; flag designs that contact too many of these.
+          res: [B80-B87, B61-B66, B11-B16, B30-B33]   # adjust per campaign — reference PDB numbering
+
+        scaffoldguided:
+          scaffoldguided: True
+
+          # Parent directory with one subfolder per scaffold (each containing *_ss.pt / *_adj.pt).
+          # Per-scaffold paths are injected when generating configs from designs_config.scaffolds.
+          scaffold_dir: /storage/hCG/scaffold_ss_adj_backup/nanobody
+          systematic: True
+
+          # Provide the hCG target so the binder is generated in context
+          target_pdb: True
+          target_path: /storage/hCG/truncated_renumbered_loops_B_chain.pdb
+          target_ss:  /storage/hCG/rfdiffusion/target_ss_adj/truncated_renumbered_loops_ss.pt
+          target_adj: /storage/hCG/rfdiffusion/target_ss_adj/truncated_renumbered_loops_adj.pt
+
+          # Keep loops flexible — allow the model to extend loop regions as needed
+          mask_loops: True
+
+          # Optional: allow small insertions/extensions to increase diversity
+          sampled_insertion: 5   # up to 5 residues inserted into loops
+          sampled_N: 3           # up to 3 residues added at N-terminus
+          sampled_C: 3           # up to 3 residues added at C-terminus
+
+        denoiser:
+          # Recommended for scaffold-guided PPI
+          noise_scale_ca: 0.5
+          noise_scale_frame: 0.5
+      naming_prefix: scaffold_guided
+      scaffolds_root_dir: /storage/hCG/scaffold_ss_adj_backup
+      scaffolds:
+      - affibody
+      - affimer
+      - affitin
+      - monobody
+      - nanobody
+      insertions_for_scaffolds:
+        affitin:
+          mask_loops: true
+          sampled_insertion: 2
+          sampled_N: 1
+          sampled_C: 1
+        affibody:
+          mask_loops: false
+          sampled_insertion: 0
+          sampled_N: 0
+          sampled_C: 0
+        affimer:
+          mask_loops: true
+          sampled_insertion: 5
+          sampled_N: 3
+          sampled_C: 3
+        monobody:
+          mask_loops: true
+          sampled_insertion: 2
+          sampled_N: 1
+          sampled_C: 1
+        nanobody:
+          mask_loops: true
+          sampled_insertion: 2
+          sampled_N: 1
+          sampled_C: 1
+boltzgen:
+  enabled: true
+  docker_image: boltzgen
+  num_designs: 20
+  extra_args: []
+  designs_config:
+    affimer_4N6T:
+      design_spec_yaml: /storage/proteindesign/dagster_pipeline/dagster_pipeline/default_boltzgen_design_spec.yaml
+      binder_sequence_file: /storage/hCG/scaffolds/affimer_4N6T_with_Nterm_design_fragments.txt
+      target_pdb: /storage/hCG/hCG_no_glycans.pdb
+      hotspots_txts_dir: /storage/hCG/hotspots/both_loops/
+      antihotspots:
+        enabled: true
+        contact_distance: 10.0
+        max_antihotspot_contact_fraction: 0.05
+        res:
+        - B80-B87
+        - B61-B66
+        - B11-B16
+        - B30-B33
+    affibody_2B89:
+      design_spec_yaml: /storage/proteindesign/dagster_pipeline/dagster_pipeline/default_boltzgen_design_spec.yaml
+      binder_sequence_file: /storage/hCG/scaffolds/affibody_2B89_design_fragments.txt
+      target_pdb: /storage/hCG/hCG_no_glycans.pdb
+      hotspots_txts_dir: /storage/hCG/hotspots/both_loops/
+      antihotspots:
+        enabled: true
+        contact_distance: 10.0
+        max_antihotspot_contact_fraction: 0.05
+        res:
+        - B80-B87
+        - B61-B66
+        - B11-B16
+        - B30-B33
+    affitin:
+      design_spec_yaml: /storage/proteindesign/dagster_pipeline/dagster_pipeline/default_boltzgen_design_spec.yaml
+      binder_sequence_file: /storage/hCG/scaffolds/affitin_design_fragments.txt
+      target_pdb: /storage/hCG/hCG_no_glycans.pdb
+      hotspots_txts_dir: /storage/hCG/hotspots/both_loops/
+      antihotspots:
+        enabled: true
+        contact_distance: 10.0
+        max_antihotspot_contact_fraction: 0.05
+        res:
+        - B80-B87
+        - B61-B66
+        - B11-B16
+        - B30-B33
+    monobody_1TTG:
+      design_spec_yaml: /storage/proteindesign/dagster_pipeline/dagster_pipeline/default_boltzgen_design_spec.yaml
+      binder_sequence_file: /storage/hCG/scaffolds/monobody_1TTG_design_fragments.txt
+      target_pdb: /storage/hCG/hCG_no_glycans.pdb
+      hotspots_txts_dir: /storage/hCG/hotspots/both_loops/
+      antihotspots:
+        enabled: true
+        contact_distance: 10.0
+        max_antihotspot_contact_fraction: 0.05
+        res:
+        - B80-B87
+        - B61-B66
+        - B11-B16
+        - B30-B33
+    nanobody_1I3V:
+      design_spec_yaml: /storage/proteindesign/dagster_pipeline/dagster_pipeline/default_boltzgen_design_spec.yaml
+      binder_sequence_file: /storage/hCG/scaffolds/nanobody_1I3V_design_fragments.txt
+      target_pdb: /storage/hCG/hCG_no_glycans.pdb
+      hotspots_txts_dir: /storage/hCG/hotspots/both_loops/
+      antihotspots:
+        enabled: true
+        contact_distance: 10.0
+        max_antihotspot_contact_fraction: 0.05
+        res:
+        - B80-B87
+        - B61-B66
+        - B11-B16
+        - B30-B33
+structure_filters:
+  enabled: true
+  structure_docker_image: structure_tools
 proteinmpnn:
   docker_image: rosettacommons/proteinmpnn
-  gpus: 1,2
   chain_list: A
-  num_seq_per_target: 5
-  fixed_positions_jsonl: ''
+  num_seq_per_target: 10
   omit_AAs: X
+  # Extra AAs to omit when the scaffold name appears in the partition / design name.
+  omit_AA:
+    affimer: C
+    affibody: C
+    affitin: C
+    monobody: C
+    nanobody: C
   sampling_temp: '0.1'
   use_soluble_model: true
   extra_args: []
+soluprot:
+  docker_image: soluprot
+  enabled: true
+  min_soluble_score: 0.5
+  no_proc: 1
+  fail_if_all_filtered: false
+msa:
+  server_url: http://127.0.0.1:18080/api
+  pairing_strategy: greedy
+  use_env: true
+  request_timeout_seconds: 120.0
+  max_retries: 20
+  poll_interval_seconds: 5.0
+  retry_backoff_seconds: 2.0
+  max_paired_seqs: 8192
+  max_msa_seqs: 16384
 boltz2:
   template_yaml: /storage/proteindesign/dagster_pipeline/dagster_pipeline/default_boltz2_template.yaml
-  docker_image: boltz2
-  gpus: 1,2
-  cache_volume: boltz2-cache
-  use_msa_server: true
-  use_potentials: false
-  override: false
-  recycling_steps: 3
-  devices: 1
-  diffusion_samples: 1
-  num_workers: 0
-  no_kernels: true
-  query_chunk_size: 10
-colabfold:
-  target_epitope_fasta: /storage/hCG/loops_epitope_target.fasta
+  target_fasta: /storage/hCG/loops_epitope_target_alpha_beta.fasta
+  target_pdb: /storage/hCG/hCG_no_glycans.pdb
   fasta_extensions:
   - .fa
   - .fasta
   - .faa
-  gpus: 1,2
-  model_type: alphafold2_multimer_v3
-  pair_mode: unpaired_paired
-  num_models: 5
-  num_recycle: 3
-  num_relax: 0
+  docker_image: boltz2
+  use_potentials: false
+  override: false
+  recycling_steps: 3
+  diffusion_samples: 5
+  num_workers: 0
+  preprocessing_threads: 2
+  devices: 1
   query_chunk_size: 10
-  colabfold_image: ghcr.io/sokrypton/colabfold:1.6.0-cuda12
-  colabfold_cache_host: /storage/proteindesign/ColabFold_cache
-  apply_alphafold_numpy_patch: true
-  extra_colabfold_args: []
-filters:
-  docker_image: proteindesign-filters
-  align_chain: B
-  rmsd_chains: A,B
+esmfold:
+  docker_image: esmfold2
+  model: biohub/ESMFold2
+  num_loops: 20
+  num_sampling_steps: 100
+  num_diffusion_samples: 5
+  seed: 0
+  query_chunk_size: 10
+  renumber_outputs: true
+final_scores:
+  docker_image: final_scores
+  cpus: 4
+  dalphaball_path: /usr/local/lib/final_scores/DAlphaBall.gcc
+  ipsae_script: /storage/shaburova/antibodies/IPSAE/ipsae.py
+  skip_ipsae: false
+  hotspots: []
+  antihotspots: []
+filtered_designs:
+  enabled: true
+  thresholds_json: /storage/proteindesign/zebra_developability/pyrosetta_thresholds.json
+  predictor: auto
+  min_hotspot_contact_fraction: 0.75
+  max_binder_seq_len: 125
+  min_interface_hbonds: 1
+  skip_dg_threshold: true

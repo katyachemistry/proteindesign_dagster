@@ -1,0 +1,17 @@
+# Launchpad template for the register_sequences job (register_sequence_partitions).
+# Paths below are examples — adjust add_to_run_id, input_path, and target_fasta per run.
+
+add_to_run_id: ""
+input_path: ""
+outputs_root: /storage/hCG/designs/runs
+target_fasta: /storage/hCG/loops_epitope_target_alpha_beta.fasta
+
+# Hotspot residues for final_scores coverage (reference PDB numbering).
+# Example for a loop3 campaign:
+# hotspots: [B20, B21, B22, B77]
+hotspots: []
+
+# Antihotspots contacted by the binder (reference PDB numbering; ranges supported).
+# Example:
+# antihotspots: [B80-B87, B61-B66, B11-B16, B30-B33]
+antihotspots: []
