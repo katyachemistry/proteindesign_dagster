@@ -1657,8 +1657,10 @@ def promera_generation(
         "-e", "LIGANDMPNN_DIR=/ligandmpnn",
         "-e", "ABMPNN_CHECKPOINT=/ligandmpnn/model_params/abmpnn.pt",
         pm.docker_image,
+        "--task", "promera.inference.Design",
         "--task_config", str(task_config),
         f"output={raw_out}",  # override the YAML's own `output:` so it lands under proot
+        f"trainer.devices={_gpu_device_count(pc.gpus)}",
     ]
     _run(context, cmd)
 
