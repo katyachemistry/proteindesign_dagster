@@ -293,6 +293,34 @@ class BoltzGenToolConfig(Config):
                 out[name] = spec
         return out
 
+DEFAULT_PROMERA_TARGET_FASTA = "/storage/hCG/loops_epitope_target.fasta"
+
+
+class PromeraDesignSpec(BaseModel):
+    """One named Promera design input bundle (task_config template → shared structure filter).
+
+    ``task_config_yaml`` is a *template* (test_script.yaml-style, comments kept) —
+    ``input:`` (target/*.json directory) and ``epitope_residues:`` are regenerated
+    per partition from ``target_fasta`` and ``hotspots_txts_dir`` below, the same
+    way RFdiffusion/BoltzGen assemble ``target_pdb`` + ``hotspots_txts_dir`` into
+    their own generated configs (see ``generate_promera_yamls.py``). Nothing here
+    duplicates promera's own diffusion/binder hyperparameters, which stay in the
+    template untouched.
+    """
+
+    task_config_yaml: str
+    hotspots_txts_dir: str = DEFAULT_HOTSPOTS_TXTS_DIR
+    target_fasta: str = DEFAULT_PROMERA_TARGET_FASTA
+    # Chain id written into the generated target/*.json and into the template's
+    # `epitope_chain:` / `target_chains:` scalars. Matches the hotspot file chain
+    # prefix (e.g. "B21" -> epitope_chain "B").
+    epitope_chain: str = "B"
+    # Reference PDB for design_structure_filter only — independent of whatever
+    # promera itself was conditioned on internally (target/*.json sequence).
+    target_pdb: str = DEFAULT_BOLTZGEN_TARGET_PDB
+    antihotspots: BoltzGenAntihotspotsSettings = Field(default_factory=BoltzGenAntihotspotsSettings)
+
+
 class PromeraToolConfig(Config):
     """Container/runtime parameters for Promera VHH backbone generation."""
 
@@ -304,19 +332,27 @@ class PromeraToolConfig(Config):
     ligandmpnn_dir: str = "/storage/proteindesign/promera/LigandMPNN"
     shared_group_gid: int = 1024  # proteindesign — matches docker_user_args.sh usage
 
-    # Each entry = one full promera task_config YAML (test_script.yaml-style) +
-    # the dagster-side hotspot/antihotspot definition used for design_structure_filter
-    # (independent of whatever promera itself was conditioned on internally).
-    designs_config: Dict[str, "PromeraDesignSpec"] = Field(default_factory=dict)
+    # Each entry = one promera campaign: a task_config template + the dagster-side
+    # hotspot/antihotspot definition used for design_structure_filter (independent
+    # of whatever promera itself was conditioned on internally).
+    # Dict[str, Any] (not Dict[str, PromeraDesignSpec]) because Dagster's Config
+    # schema inference cannot resolve a nested plain pydantic.BaseModel directly —
+    # same reason DesignSpec/BoltzGenDesignSpec use this pattern below; the
+    # field_validator coerces each entry into a PromeraDesignSpec afterward.
+    designs_config: Dict[str, Any] = Field(default_factory=dict, validate_default=True)
 
-class PromeraDesignSpec(BaseModel):
-    task_config_yaml: str          # promera's own full YAML (test_script.yaml-style)
-    target_pdb: str                # reference PDB for design_structure_filter
-    target_pdb_chain: str = "B"
-    target_res_min: int = 1
-    target_res_max: int = 102      # promera's own target-chain length for this campaign
-    hotspot_res: List[str] = Field(default_factory=list)         # e.g. ["B21","B22","B76","B77"]
-    antihotspots: BoltzGenAntihotspotsSettings = Field(default_factory=BoltzGenAntihotspotsSettings)
+    @field_validator("designs_config", mode="before")
+    @classmethod
+    def _coerce_promera_design_specs(cls, v: Any) -> Any:
+        if not isinstance(v, dict):
+            return v
+        out: dict[str, Any] = {}
+        for name, spec in v.items():
+            out[name] = (
+                PromeraDesignSpec.model_validate(spec) if isinstance(spec, dict) else spec
+            )
+        return out
+
 
 class StructureFiltersToolConfig(Config):
     """Docker image for structure-based filter and renumbering scripts."""

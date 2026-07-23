@@ -92,6 +92,7 @@ from dagster_pipeline.resources import (
     DesignSpec,
     ProteinMPNNToolConfig,
     RFDiffusionToolConfig,
+    PromeraToolConfig,
     SoluProtToolConfig,
     ESMFoldToolConfig,
     FinalScoresToolConfig,
@@ -116,6 +117,8 @@ from utils.load_rfdiffusion_antihotspots import (  # noqa: E402
     load_antihotspots_config,
     rfdiffusion_config_path,
 )
+from utils.generate_promera_yamls import generate_promera_task_configs  # noqa: E402
+from utils.normalize_promera_designs import normalize_promera_designs  # noqa: E402
 from utils.merge_fasta import explode_fasta_records_with_append, read_fasta_sequence_flat  # noqa: E402
 from utils.import_external_sequences import import_external_fasta_to_mpnn_seqs  # noqa: E402
 from utils.soluprot_filter import (  # noqa: E402
@@ -149,6 +152,7 @@ design_configs = DynamicPartitionsDefinition(name="design_configs")
 
 DESIGN_TOOL_RFDIFFUSION = "rfdiffusion"
 DESIGN_TOOL_BOLTZGEN = "boltzgen"
+DESIGN_TOOL_PROMERA = "promera"
 
 # ---------------------------------------------------------------------------
 # Pipeline-wide tool config (Launchpad template + run-scoped copy under each run dir)
@@ -169,6 +173,7 @@ class PipelineAllToolsConfig(Config):
     # Order matches the design pipeline: design → filter → MPNN → SoluProt → MSA → predict → score.
     rfdiffusion: RFDiffusionToolConfig = Field(default_factory=RFDiffusionToolConfig)
     boltzgen: BoltzGenToolConfig = Field(default_factory=BoltzGenToolConfig)
+    promera: PromeraToolConfig = Field(default_factory=PromeraToolConfig)
     structure_filters: StructureFiltersToolConfig = Field(
         default_factory=StructureFiltersToolConfig
     )
@@ -921,6 +926,87 @@ def _generate_boltzgen_configs(
     return manifest, total_files, preview_sections
 
 
+def _generate_promera_yamls(
+    context: AssetExecutionContext,
+    designs_config: Dict[str, Any],
+    run_id: str,
+    outputs_dir: str,
+) -> tuple[Dict[str, dict], int, List[str]]:
+    """Generate Promera task_config YAMLs + filter sidecars; build partition manifest entries.
+
+    Regenerates ``input`` (target/*.json) and ``epitope_residues`` per hotspot file
+    (see ``generate_promera_yamls.py``) instead of hand-editing one task_config per
+    campaign, mirroring ``_generate_rfdiffusion_yamls`` / ``_generate_boltzgen_configs``.
+    The filter sidecar reuses ``_write_boltzgen_filter_sidecar`` so
+    ``design_structure_filter`` needs no promera-specific code path.
+    """
+    manifest: Dict[str, dict] = {}
+    preview_sections: List[str] = []
+    total_files = 0
+    configs_root = Path(outputs_dir) / "design_configs" / DESIGN_TOOL_PROMERA
+
+    for design_name, design in designs_config.items():
+        out_dir = configs_root / design_name
+        context.log.info(
+            f"Generating promera task_configs for {design_name}: "
+            f"{Path(design.task_config_yaml).name} × "
+            f"{Path(design.hotspots_txts_dir).name} → {out_dir}"
+        )
+        generated = generate_promera_task_configs(
+            Path(design.task_config_yaml),
+            Path(design.hotspots_txts_dir),
+            out_dir,
+            Path(design.target_fasta),
+            design_name,
+            epitope_chain=design.epitope_chain,
+        )
+        anti = design.antihotspots.model_dump()
+        for _hotspot_file, task_config_path, _target_dir, epitope_residues in generated:
+            # ppi.hotspot_res for the shared filter uses chain-prefixed labels
+            # (e.g. "B21"), like RFdiffusion/BoltzGen — not promera's own
+            # plain-int epitope_residues.
+            hotspot_res = [f"{design.epitope_chain}{n}" for n in epitope_residues]
+            filter_yaml = out_dir / f"{task_config_path.stem}_structure_filter.yaml"
+            _write_boltzgen_filter_sidecar(
+                filter_yaml,
+                hotspot_res=hotspot_res,
+                antihotspots=anti,
+            )
+            total_files += 2
+
+            yaml_name = task_config_path.name
+            partition_key = _make_partition_key(
+                run_id,
+                DESIGN_TOOL_PROMERA,
+                design_name,
+                design.target_pdb,
+                design.hotspots_txts_dir,
+                yaml_name,
+            )
+            subdir = _design_partition_suffix(
+                DESIGN_TOOL_PROMERA,
+                design_name,
+                design.target_pdb,
+                design.hotspots_txts_dir,
+                yaml_name,
+            )
+            manifest[partition_key] = {
+                "run_id": run_id,
+                "tool": DESIGN_TOOL_PROMERA,
+                "subdir": subdir,
+                "design_name": design_name,
+                "config_dir": str(out_dir),
+                "config_name": task_config_path.stem,
+                "task_config_yaml": str(task_config_path),
+                "filter_config_yaml": str(filter_yaml),
+                "target_pdb": design.target_pdb,
+                "epitope_chain": design.epitope_chain,
+            }
+        preview_sections.append(_yaml_preview(out_dir))
+
+    return manifest, total_files, preview_sections
+
+
 # ---------------------------------------------------------------------------
 # configs group  (non-partitioned seed asset)
 # ---------------------------------------------------------------------------
@@ -974,11 +1060,24 @@ def pipeline_config(
     else:
         context.log.info("boltzgen.enabled=false — skipping BoltzGen config generation")
 
+    if config.promera.enabled:
+        pm_manifest, n, previews = _generate_promera_yamls(
+            context,
+            config.promera.designs_config,
+            run_id,
+            outputs_dir,
+        )
+        manifest.update(pm_manifest)
+        total_files += n
+        preview_sections.extend(previews)
+    else:
+        context.log.info("promera.enabled=false — skipping Promera config generation")
+
     if not manifest:
         raise Failure(
             description=(
                 "No design partitions generated. Enable at least one of "
-                "rfdiffusion.enabled or boltzgen.enabled."
+                "rfdiffusion.enabled, boltzgen.enabled, or promera.enabled."
             )
         )
 
@@ -1015,6 +1114,7 @@ def pipeline_config(
             "design_configs_dir": MetadataValue.path(str(Path(outputs_dir) / "design_configs")),
             "rfdiffusion_enabled": config.rfdiffusion.enabled,
             "boltzgen_enabled": config.boltzgen.enabled,
+            "promera_enabled": config.promera.enabled,
             "proteinmpnn_num_seq_per_target": config.proteinmpnn.num_seq_per_target,
             "total_yamls": total_files,
             "partition_count": len(manifest),
@@ -1482,11 +1582,112 @@ def boltzgen_generation(
 
 
 @asset(
+    group_name="promera",
+    partitions_def=design_configs,
+    deps=[pipeline_config],
+    description=(
+        "Runs Promera (``python -m promera --task_config ...``) for partitions with "
+        "``tool=promera``, then normalizes ``sample*/backbone.pdb`` into "
+        "``designs/promera/design_N.pdb`` (chain A=binder, B=target — already correct, "
+        "no remap needed, unlike BoltzGen). No-ops for other tools."
+    ),
+)
+def promera_generation(
+    context: AssetExecutionContext,
+) -> MaterializeResult:
+    pc = _read_pipeline_config(partition_key=context.partition_key)
+    pm = pc.promera
+    partition_key = context.partition_key
+    manifest = _read_manifest(_run_outputs_dir(pc))
+    if partition_key not in manifest:
+        raise KeyError(
+            f"Partition '{partition_key}' not found in manifest. "
+            "Re-run `generate_configs` to regenerate it."
+        )
+    entry = manifest[partition_key]
+    tool = entry.get("tool")
+    if tool != DESIGN_TOOL_PROMERA:
+        context.log.info(
+            f"[promera_generation] partition={partition_key} tool={tool} — skipping"
+        )
+        return MaterializeResult(
+            metadata={
+                "partition_key": partition_key,
+                "tool": tool or "",
+                "skipped": True,
+                "reason": f"tool is {tool}, not {DESIGN_TOOL_PROMERA}",
+            }
+        )
+
+    task_config = Path(entry["task_config_yaml"])
+    config_dir = Path(entry["config_dir"])
+    if not task_config.is_file():
+        raise FileNotFoundError(f"Promera task_config missing: {task_config}")
+
+    context.log.info(
+        f"[promera_generation] partition={partition_key}  task_config={task_config}"
+    )
+
+    proot = _partition_root(_run_outputs_dir(pc), partition_key, pc.run_id)
+    designs_dir = _designs_dir(proot, DESIGN_TOOL_PROMERA)
+    raw_out = designs_dir / "promera_run"
+    designs_dir.mkdir(parents=True, exist_ok=True)
+    raw_out.mkdir(parents=True, exist_ok=True)
+
+    weights_host = Path(pm.weights_host).resolve()
+    cache_host = Path(pm.tinyprot_cache_host).resolve()
+    cache_host.mkdir(parents=True, exist_ok=True)
+    ligandmpnn_dir = Path(pm.ligandmpnn_dir).resolve()
+
+    cmd: List[str] = [
+        "docker", "run", "--rm", *_docker_user_args(),
+        "--group-add", str(pm.shared_group_gid),
+        "--runtime=nvidia", *_docker_gpu_args(pc.gpus),
+        "-v", f"{weights_host}:/weights:ro",
+        "-v", f"{cache_host}:/cache:rw",
+        "-v", f"{ligandmpnn_dir}:/ligandmpnn:ro",
+        # task_config's own `input:` (target/*.json) lives under config_dir too —
+        # one mount covers both, same "host path == container path" convention
+        # used for target_pdb/model dirs elsewhere in this module.
+        "-v", f"{config_dir}:{config_dir}",
+        "-v", f"{raw_out}:{raw_out}",
+        "-e", f"PROMERA_WEIGHTS=/weights/{pm.weights_file}",
+        "-e", "TINYPROT_CACHE=/cache",
+        "-e", "LIGANDMPNN_DIR=/ligandmpnn",
+        "-e", "ABMPNN_CHECKPOINT=/ligandmpnn/model_params/abmpnn.pt",
+        pm.docker_image,
+        "--task_config", str(task_config),
+        f"output={raw_out}",  # override the YAML's own `output:` so it lands under proot
+    ]
+    _run(context, cmd)
+
+    # Promera writes {output}/{target_name}/sample*/backbone.pdb, where target_name
+    # is the stem of the target/*.json file — which generate_promera_task_configs
+    # names identically to the task_config itself (one target per generated config).
+    promera_raw_target_dir = raw_out / task_config.stem
+    index = normalize_promera_designs(promera_raw_target_dir, designs_dir)
+    pdb_count = index["design_count"]
+
+    context.log.info(f"Promera design done → {designs_dir}  ({pdb_count} PDB(s))")
+    return MaterializeResult(
+        metadata={
+            "partition_key": partition_key,
+            "tool": DESIGN_TOOL_PROMERA,
+            "skipped": False,
+            "task_config_yaml": MetadataValue.path(str(task_config)),
+            "designs_dir": MetadataValue.path(str(designs_dir)),
+            "raw_dir": MetadataValue.path(str(promera_raw_target_dir)),
+            "pdb_count": pdb_count,
+        }
+    )
+
+
+@asset(
     group_name="design_filter",
     partitions_def=design_configs,
-    deps=[rfdiffusion_generation, boltzgen_generation],
+    deps=[rfdiffusion_generation, boltzgen_generation, promera_generation],
     description=(
-        "Shared structure filter for RFdiffusion and BoltzGen design PDBs. "
+        "Shared structure filter for RFdiffusion, BoltzGen, and Promera design PDBs. "
         "Optionally computes binder–target CA contact reports "
         "(when ``antihotspots.enabled`` and ``structure_filters.enabled``), then applies "
         "hotspot / antihotspot rules (100% hotspot coverage required; antihotspot "
@@ -3074,6 +3275,7 @@ all_assets = [
     import_binder_sequences,
     rfdiffusion_generation,
     boltzgen_generation,
+    promera_generation,
     design_structure_filter,
     proteinmpnn_parsed,
     proteinmpnn_sequences,

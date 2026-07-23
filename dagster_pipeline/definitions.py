@@ -34,9 +34,10 @@ generate_configs_job = define_asset_job(
     description=(
         "Save tool parameters to {outputs_root}/{run_id}/pipeline_config.yaml (new timestamped "
         "run dir each launch unless run_id is set), generate configs for enabled design tools "
-        "under {outputs_root}/{run_id}/design_configs/{rfdiffusion|boltzgen}/, and register "
-        "them as partitions. Enable tools via rfdiffusion.enabled / boltzgen.enabled. "
-        "Launchpad pre-fills from dagster_pipeline/pipeline_config.yaml (template only)."
+        "under {outputs_root}/{run_id}/design_configs/{rfdiffusion|boltzgen|promera}/, and "
+        "register them as partitions. Enable tools via rfdiffusion.enabled / boltzgen.enabled / "
+        "promera.enabled. Launchpad pre-fills from dagster_pipeline/pipeline_config.yaml "
+        "(template only)."
     ),
 )
 
@@ -45,6 +46,7 @@ design_pipeline_job = define_asset_job(
     selection=[
         "rfdiffusion_generation",
         "boltzgen_generation",
+        "promera_generation",
         "design_structure_filter",
         "proteinmpnn_parsed",
         "proteinmpnn_sequences",
@@ -60,9 +62,9 @@ design_pipeline_job = define_asset_job(
     partitions_def=design_configs,
     description=(
         "Run the full design pipeline for one or more partitions "
-        "(RFdiffusion and/or BoltzGen → structure filter → ProteinMPNN → SoluProt → "
-        "precomputed MSAs → Boltz-2, alongside MSA-free ESMFold). Partitions are tool-tagged "
-        "({run_id}__{rfdiffusion|boltzgen}__…). "
+        "(RFdiffusion and/or BoltzGen and/or Promera → structure filter → ProteinMPNN → "
+        "SoluProt → precomputed MSAs → Boltz-2, alongside MSA-free ESMFold). Partitions are "
+        "tool-tagged ({run_id}__{rfdiffusion|boltzgen|promera}__…). "
         "Partitions with zero designs after a filter step succeed with downstream "
         "assets skipped (not failed). Select partition(s) in the Launchpad. "
         "Run generate_configs first if partitions are not yet populated."
