@@ -1,6 +1,14 @@
+######========MAIN=======######
 gpus: 1,2
 run_id: ''
 outputs_root: /storage/hCG/designs/runs
+
+#####################################
+######========PREDICTION=======###### 
+#####################################
+
+
+######========RFDiffusion=======######
 rfdiffusion:
   enabled: false
   docker_image: rfdiffusion
@@ -102,6 +110,9 @@ rfdiffusion:
           sampled_insertion: 2
           sampled_N: 1
           sampled_C: 1
+
+
+######========BoltzGen=======######          
 boltzgen:
   enabled: true
   docker_image: boltzgen
@@ -178,9 +189,32 @@ boltzgen:
         - B61-B66
         - B11-B16
         - B30-B33
+
+
+
+######========Promera=======######  
+promera:
+  enabled: true
+  designs_config:
+    loop1_loop3:  ##name of the run
+      task_config_yaml: /storage/proteindesign/promera/test_script.yaml
+      target_fasta: /storage/hCG/loops_epitope_target_fullB.fasta   ##generation
+      target_pdb: /storage/hCG/hCG_no_glycans.pdb                    ##filtration
+      hotspots_txts_dir: /storage/hCG/hotspots/both_loops/
+      hotspot_files: []   # список конкретных .txt файлов из этой папки на партицию, если [] - будут взяты все файлы
+
+######========Structure Filtering=======######  
 structure_filters:
   enabled: true
   structure_docker_image: structure_tools
+
+
+
+##########################################
+######========INVERSE FOLDING=======###### 
+##########################################
+
+######========ProteinMPNN=======######    
 proteinmpnn:
   docker_image: rosettacommons/proteinmpnn
   chain_list: A
@@ -194,14 +228,23 @@ proteinmpnn:
     monobody: C
     nanobody: C
   sampling_temp: '0.1'
-  use_soluble_model: true
+  use_soluble_model: false
   extra_args: []
+
+######========Soluprot=======######   
 soluprot:
   docker_image: soluprot
   enabled: true
   min_soluble_score: 0.5
   no_proc: 1
   fail_if_all_filtered: false
+
+
+####################################
+######========REFOLDING=======###### 
+####################################
+
+######========MSA settings=======######   
 msa:
   server_url: http://127.0.0.1:18080/api
   pairing_strategy: greedy
@@ -212,6 +255,8 @@ msa:
   retry_backoff_seconds: 2.0
   max_paired_seqs: 8192
   max_msa_seqs: 16384
+
+######========Boltz2=======######   
 boltz2:
   template_yaml: /storage/proteindesign/dagster_pipeline/dagster_pipeline/default_boltz2_template.yaml
   target_fasta: /storage/hCG/loops_epitope_target_alpha_beta.fasta
@@ -229,6 +274,9 @@ boltz2:
   preprocessing_threads: 2
   devices: 1
   query_chunk_size: 10
+  renumber_outputs: true
+
+######========ESMFold=======###### 
 esmfold:
   docker_image: esmfold2
   model: biohub/ESMFold2
@@ -238,6 +286,12 @@ esmfold:
   seed: 0
   query_chunk_size: 10
   renumber_outputs: true
+
+
+##########################################
+######========FINAL FILTERING=======###### 
+##########################################
+######========Final scores=======######   
 final_scores:
   docker_image: final_scores
   cpus: 4
@@ -246,11 +300,43 @@ final_scores:
   skip_ipsae: false
   hotspots: []
   antihotspots: []
+
+######========Final designs=======###### 
 filtered_designs:
   enabled: true
-  thresholds_json: /storage/proteindesign/zebra_developability/pyrosetta_thresholds.json
-  predictor: auto
-  min_hotspot_contact_fraction: 0.75
-  max_binder_seq_len: 125
-  min_interface_hbonds: 1
-  skip_dg_threshold: true
+  specificity_hotspots_required: 2
+  min_parent_successes: 5
+  min_seq_successes_fallback: 4
+  min_good_binder_scores: 2
+  max_binder_score: 0.0
+
+######========LH off-target (Rule B)=======######
+lh_offtarget_b:
+  enabled: true
+  target_fasta: /storage/hCG/LH_alpha_beta.fasta
+
+######========LH off-target (Rule A/C after AF3)=======######
+lh_offtarget_ac:
+  enabled: true
+  target_fasta: /storage/hCG/LH_alpha_beta.fasta
+  hotspots_dir: /storage/hCG/hotspots/both_loops
+
+######========Rule B Marp presentation=======######
+rule_b_presentation:
+  enabled: true
+  pymol: /home/kb/miniforge3/envs/bio-ds/bin/pymol
+  scaffolds_dir: /storage/hCG/scaffolds
+  marp_docker_image: marpteam/marp-cli:v4.1.2
+  seed: 0
+  export_pdf: true
+  export_pptx: true
+
+######========Rule A/C Marp presentation=======######
+rule_ac_presentation:
+  enabled: true
+  pymol: /home/kb/miniforge3/envs/bio-ds/bin/pymol
+  scaffolds_dir: /storage/hCG/scaffolds
+  marp_docker_image: marpteam/marp-cli:v4.1.2
+  seed: 0
+  export_pdf: true
+  export_pptx: true

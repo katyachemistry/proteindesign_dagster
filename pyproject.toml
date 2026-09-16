@@ -8,6 +8,10 @@ dependencies = [
   "dagster>=1.8.0",
   "dagster-webserver>=1.8.0",
   "pydantic>=2.0",
+  # Host-side optional; lh_binding_scores itself runs in final_scores Docker.
+  "numpy",
+  "scipy",
+  "biopython",
 ]
 
 [project.optional-dependencies]

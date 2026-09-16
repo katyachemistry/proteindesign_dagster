@@ -6,6 +6,9 @@ channels:
   - conda-forge
 dependencies:
   - python=3.11
+  - numpy
+  - scipy
+  - biopython
   - pip
   - pip:
       - dagster>=1.8.0

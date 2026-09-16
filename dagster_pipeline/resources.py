@@ -5,6 +5,9 @@ import yaml
 from dagster import Config
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+
+############---DEFAULT PARAMETERS---############
+
 DEFAULT_OUTPUTS_ROOT = "/storage/hCG/designs/runs"
 # Legacy default kept for docs/scripts that still reference a single outputs folder.
 DEFAULT_OUTPUTS_DIR = "/storage/hCG/designs/outputs"
@@ -74,6 +77,7 @@ DEFAULT_INSERTIONS_FOR_SCAFFOLDS: dict[str, dict[str, bool | int]] = {
     },
 }
 
+############---RFDIFFUSION PARAMETERS---############
 
 class ScaffoldInsertionSettings(BaseModel):
     """Per-scaffold RFdiffusion loop masking and length sampling overrides."""
@@ -144,37 +148,6 @@ class DesignSpec(BaseModel):
         return self
 
 
-class BoltzGenAntihotspotsSettings(BaseModel):
-    """Hotspot / antihotspot contact filter settings for BoltzGen partitions."""
-
-    enabled: bool = True
-    contact_distance: float = 10.0
-    # Fraction of configured antihotspot residues allowed to contact (0–1).
-    # Applied only when every hotspot is contacted.
-    max_antihotspot_contact_fraction: float = Field(default=0.05, ge=0.0, le=1.0)
-    res: List[str] = Field(default_factory=lambda: list(DEFAULT_ANTIHOTSPOT_RES))
-
-
-class BoltzGenDesignSpec(BaseModel):
-    """One named BoltzGen design-only input bundle (design step → shared structure filter)."""
-
-    design_spec_yaml: str = DEFAULT_BOLTZGEN_DESIGN_SPEC
-    target_pdb: str = DEFAULT_BOLTZGEN_TARGET_PDB
-    hotspots_txts_dir: str = DEFAULT_HOTSPOTS_TXTS_DIR
-    # BoltzGen design-fragment sequence file (``.txt``; letters = fixed AA, N..M = designed).
-    # Injected as protein entity with id ``binder_chain`` when generating YAMLs.
-    binder_sequence_file: Optional[str] = None
-    antihotspots: BoltzGenAntihotspotsSettings = Field(
-        default_factory=BoltzGenAntihotspotsSettings
-    )
-    protocol: str = "protein-anything"
-    binder_chain: str = "C"
-    # Keep source beta chain B as normalized chain B so hotspot labels remain valid.
-    target_chains: List[str] = Field(default_factory=lambda: ["B", "A"])
-    # YAML / partition naming stem; defaults to the designs_config entry name when unset.
-    naming_prefix: Optional[str] = None
-
-
 class RFDiffusionToolConfig(Config):
     """Container/runtime parameters for the RFdiffusion backbone generation step."""
 
@@ -222,6 +195,39 @@ class RFDiffusionToolConfig(Config):
                 }
             out[name] = DesignSpec.model_validate(spec)
         return out
+
+
+############---BOLTZGEN PARAMETERS---############
+
+class BoltzGenAntihotspotsSettings(BaseModel):
+    """Hotspot / antihotspot contact filter settings for BoltzGen partitions."""
+
+    enabled: bool = True
+    contact_distance: float = 10.0
+    # Fraction of configured antihotspot residues allowed to contact (0–1).
+    # Applied only when every hotspot is contacted.
+    max_antihotspot_contact_fraction: float = Field(default=0.05, ge=0.0, le=1.0)
+    res: List[str] = Field(default_factory=lambda: list(DEFAULT_ANTIHOTSPOT_RES))
+
+
+class BoltzGenDesignSpec(BaseModel):
+    """One named BoltzGen design-only input bundle (design step → shared structure filter)."""
+
+    design_spec_yaml: str = DEFAULT_BOLTZGEN_DESIGN_SPEC
+    target_pdb: str = DEFAULT_BOLTZGEN_TARGET_PDB
+    hotspots_txts_dir: str = DEFAULT_HOTSPOTS_TXTS_DIR
+    # BoltzGen design-fragment sequence file (``.txt``; letters = fixed AA, N..M = designed).
+    # Injected as protein entity with id ``binder_chain`` when generating YAMLs.
+    binder_sequence_file: Optional[str] = None
+    antihotspots: BoltzGenAntihotspotsSettings = Field(
+        default_factory=BoltzGenAntihotspotsSettings
+    )
+    protocol: str = "protein-anything"
+    binder_chain: str = "C"
+    # Keep source beta chain B as normalized chain B so hotspot labels remain valid.
+    target_chains: List[str] = Field(default_factory=lambda: ["B", "A"])
+    # YAML / partition naming stem; defaults to the designs_config entry name when unset.
+    naming_prefix: Optional[str] = None
 
 
 class BoltzGenToolConfig(Config):
@@ -293,7 +299,11 @@ class BoltzGenToolConfig(Config):
                 out[name] = spec
         return out
 
+
 DEFAULT_PROMERA_TARGET_FASTA = "/storage/hCG/loops_epitope_target.fasta"
+
+
+############---PROMERA PARAMETERS---############
 
 
 class PromeraDesignSpec(BaseModel):
@@ -358,8 +368,16 @@ class PromeraToolConfig(Config):
         return out
 
 
+############---STRUCTURE FILTERING---############
+
+
 class StructureFiltersToolConfig(Config):
-    """Docker image for structure-based filter and renumbering scripts."""
+    """Shared ``structure_tools`` image for design filtering and prediction renumbering.
+
+    ``enabled`` only gates ``design_structure_filter`` (backbone hotspot/antihotspot
+    filtering). Boltz-2 / ESMFold renumbering is controlled by each tool's
+    ``renumber_outputs`` flag and still uses ``structure_docker_image``.
+    """
 
     enabled: bool = True
     structure_docker_image: str = "structure_tools"
@@ -399,6 +417,8 @@ DEFAULT_OMIT_AA_BY_SCAFFOLD: Dict[str, str] = {
 }
 
 
+############---PROTEINMPNN PARAMETERS---############
+
 class ProteinMPNNToolConfig(Config):
     """Container/runtime parameters for all three ProteinMPNN steps."""
 
@@ -426,9 +446,11 @@ class ProteinMPNNToolConfig(Config):
         ),
     )
     sampling_temp: str = "0.1"
-    use_soluble_model: bool = True
+    use_soluble_model: bool = False
     extra_args: List[str] = Field(default_factory=list)
 
+
+############---SOLUPROT PARAMETERS---############
 
 class SoluProtToolConfig(Config):
     """SoluProt sequence solubility filter applied after ProteinMPNN.
@@ -451,6 +473,8 @@ class SoluProtToolConfig(Config):
             data.pop("no_tmhmm", None)
         return data
 
+
+############---BOLTZ2 PARAMETERS---############
 
 class MSAToolConfig(Config):
     """Shared precomputed MSA settings used only by the Boltz-2 branch."""
@@ -498,6 +522,12 @@ class Boltz2ToolConfig(Config):
     # ``gpus`` lists multiple IDs for RFdiffusion but Docker multi-GPU Boltz hangs.
     devices: int = 1
     query_chunk_size: int = 10
+    # Post-prediction renumbering of target chains to ``target_pdb`` numbering
+    # (``boltz2_renumber`` asset; uses ``structure_filters.structure_docker_image``).
+    renumber_outputs: bool = True
+
+
+############---ESMFOLD PARAMETERS---############
 
 class ESMFoldToolConfig(Config):
     """Parameters for ESMFold2 structure prediction (Biohub ``esmfold2`` Docker image).
@@ -516,8 +546,12 @@ class ESMFoldToolConfig(Config):
     num_diffusion_samples: int = 5
     seed: int = 0
     query_chunk_size: int = 10
+    # Post-prediction renumbering of target chains to ``boltz2.target_pdb`` numbering
+    # (``esmfold_renumber`` asset; uses ``structure_filters.structure_docker_image``).
     renumber_outputs: bool = True
 
+
+############---FINAL FILTERING---############
 
 class FinalScoresToolConfig(Config):
     """Post-prediction developability metrics (PyRosetta, IPSAE, RMSD) for Boltz-2 and ESMFold."""
@@ -538,20 +572,137 @@ class FinalScoresToolConfig(Config):
 
 
 class FilteredDesignsToolConfig(Config):
-    """Post-metrics developability filters (Filter_analysis.ipynb / pyrosetta_thresholds.json)."""
+    """Consensus filters on specificity_hotspots / binder_score; export metrics rows."""
 
     enabled: bool = True
-    thresholds_json: str = str(
-        _PROTEINDESIGN_ROOT / "zebra_developability" / "pyrosetta_thresholds.json"
+    specificity_hotspots_required: int = Field(
+        default=2,
+        description="A model is successful iff specificity_hotspots_{predictor} equals this value.",
     )
-    predictor: Literal["auto", "boltz", "esmfold", "legacy"] = Field(
-        default="auto",
-        description="auto = ESMFold columns when present, else Boltz, else legacy flat CSV.",
+    min_parent_successes: int = Field(
+        default=5,
+        description="Rule A: min successful models under one predictor for a parent design.",
     )
-    min_hotspot_contact_fraction: float = 0.75
-    max_binder_seq_len: int = 125
-    min_interface_hbonds: int = 1
-    skip_dg_threshold: bool = True
+    min_seq_successes_fallback: int = Field(
+        default=4,
+        description="Rule C: min successful models under one predictor for a single MPNN sequence.",
+    )
+    min_good_binder_scores: int = Field(
+        default=2,
+        description="Rule C: min successful models with binder_score <= max_binder_score.",
+    )
+    max_binder_score: float = Field(
+        default=0.0,
+        description="Rule C: binder_score threshold (pass if <= this value).",
+    )
+    rule_b_min_each: int = Field(
+        default=2,
+        description="Rule B option 1: min successes required on both boltz and esmfold.",
+    )
+    rule_b_min_minor: int = Field(
+        default=1,
+        description="Rule B option 2: min successes on the weaker predictor.",
+    )
+    rule_b_min_major: int = Field(
+        default=4,
+        description="Rule B option 2: min successes on the stronger predictor.",
+    )
+
+
+class LhOfftargetConfig(Config):
+    """Rule-B LH off-target Boltz-2 / ESMFold predictions and specificity CSV."""
+
+    enabled: bool = Field(
+        default=True,
+        description="When true, run LH off-target prediction after Rule B export.",
+    )
+    target_fasta: str = Field(
+        default="/storage/hCG/LH_alpha_beta.fasta",
+        description="LH alpha:beta FASTA (colon-separated) used instead of boltz2.target_fasta.",
+    )
+
+
+class LhAcOfftargetConfig(Config):
+    """Rule A/C LH off-target after AF3 success filtering."""
+
+    enabled: bool = Field(
+        default=True,
+        description="When true, run AF3 gate + LH-AC off-target after Rule A/C export.",
+    )
+    target_fasta: str = Field(
+        default="/storage/hCG/LH_alpha_beta.fasta",
+        description="LH alpha:beta FASTA for Rule A/C off-target predictions.",
+    )
+    hotspots_dir: str = Field(
+        default="/storage/hCG/hotspots/both_loops",
+        description="Directory of hotspot_residues_loop1_loop3_setN.txt files for AF3 scoring.",
+    )
+
+
+class RuleBPresentationConfig(Config):
+    """Marp deck (+ PDF / PPTX) for Rule B successes after LH specificity scoring."""
+
+    enabled: bool = Field(
+        default=True,
+        description="When true, build deck_rule_b.md + PDF/PPTX after lh_binding_scores.",
+    )
+    pymol: str = Field(
+        default="/home/kb/miniforge3/envs/bio-ds/bin/pymol",
+        description="PyMOL binary used to render structure snapshots.",
+    )
+    scaffolds_dir: str = Field(
+        default="/storage/hCG/scaffolds",
+        description="Directory with scaffold design-fragment text files.",
+    )
+    marp_docker_image: str = Field(
+        default="marpteam/marp-cli:v4.1.2",
+        description="Docker image used to export deck_rule_b.pdf / deck_rule_b.pptx (host marp-cli used if on PATH).",
+    )
+    seed: int = Field(
+        default=0,
+        description="RNG seed for picking which successful model to show per predictor.",
+    )
+    export_pdf: bool = Field(
+        default=True,
+        description="Export deck_rule_b.pdf in addition to deck_rule_b.md.",
+    )
+    export_pptx: bool = Field(
+        default=True,
+        description="Export deck_rule_b.pptx (one rendered image per slide) in addition to deck_rule_b.md.",
+    )
+
+
+class RuleAcPresentationConfig(Config):
+    """Marp deck (+ PDF / PPTX) for Rule A/C AF3 successes after LH-AC scoring."""
+
+    enabled: bool = Field(
+        default=True,
+        description="When true, build {run_id}/rule_ac/ after lh_ac_binding_scores.",
+    )
+    pymol: str = Field(
+        default="/home/kb/miniforge3/envs/bio-ds/bin/pymol",
+        description="PyMOL binary used to render structure snapshots.",
+    )
+    scaffolds_dir: str = Field(
+        default="/storage/hCG/scaffolds",
+        description="Directory with scaffold design-fragment text files.",
+    )
+    marp_docker_image: str = Field(
+        default="marpteam/marp-cli:v4.1.2",
+        description="Docker image used to export deck_rule_ac.pdf / deck_rule_ac.pptx.",
+    )
+    seed: int = Field(
+        default=0,
+        description="RNG seed for picking which successful model to show per predictor.",
+    )
+    export_pdf: bool = Field(
+        default=True,
+        description="Export deck_rule_ac.pdf in addition to deck_rule_ac.md.",
+    )
+    export_pptx: bool = Field(
+        default=True,
+        description="Export deck_rule_ac.pptx (one rendered image per slide) in addition to deck_rule_ac.md.",
+    )
 
 
 class RegisterSequencePartitionsConfig(Config):
@@ -591,6 +742,8 @@ class RegisterSequencePartitionsConfig(Config):
         description="Root directory containing run_id subfolders.",
     )
 
+
+############---COLABFOLD PARAMETERS---############
 
 class ColabFoldToolConfig(Config):
     """Parameters for ColabFold input preparation and prediction steps."""

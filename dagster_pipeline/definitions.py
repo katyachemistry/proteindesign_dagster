@@ -54,8 +54,10 @@ design_pipeline_job = define_asset_job(
         "MSA",
         "boltz2_input_yamls",
         "boltz2_predictions",
+        "boltz2_renumber",
         "esmfold_input_jsons",
         "esmfold_predictions",
+        "esmfold_renumber",
         # "colabfold_input_fastas",
         # "colabfold_predictions",
     ],
@@ -63,23 +65,63 @@ design_pipeline_job = define_asset_job(
     description=(
         "Run the full design pipeline for one or more partitions "
         "(RFdiffusion and/or BoltzGen and/or Promera → structure filter → ProteinMPNN → "
-        "SoluProt → precomputed MSAs → Boltz-2, alongside MSA-free ESMFold). Partitions are "
+        "SoluProt → precomputed MSAs → Boltz-2 + renumber, alongside MSA-free ESMFold + "
+        "renumber). Partitions are "
         "tool-tagged ({run_id}__{rfdiffusion|boltzgen|promera}__…). "
-        "Partitions with zero designs after a filter step succeed with downstream "
-        "assets skipped (not failed). Select partition(s) in the Launchpad. "
+        "Partitions with zero designs after a filter step succeed: downstream "
+        "assets still materialize with branch_status=no_candidates (not failed, "
+        "and not a Dagster skip that would hang asset backfills). Select "
+        "partition(s) in the Launchpad. "
         "Run generate_configs first if partitions are not yet populated."
     ),
 )
 
 final_scores_job = define_asset_job(
     name="final_scores",
-    selection=["final_scores_metrics", "filtered_designs_export"],
+    selection=[
+        "final_scores_metrics",
+        "filtered_designs_export",
+        "glycan_binder_clashes_rule_b",
+        "glycan_gs_ensemble_clashes_rule_b",
+        "lh_rule_b_inputs",
+        "lh_MSA",
+        "lh_boltz2_input_yamls",
+        "lh_boltz2_predictions",
+        "lh_esmfold_input_jsons",
+        "lh_esmfold_predictions",
+        "lh_binding_scores",
+        "rule_b_presentation",
+        "rule_b_successful_designs_zip",
+        # Rule A/C track (parallel to Rule B; soft-skips partitions without AF3/)
+        "af3_rule_ac_ready",
+        "af3_rule_ac_scores",
+        "af3_rule_ac_successes",
+        "glycan_binder_clashes_rule_ac",
+        "glycan_gs_ensemble_clashes_rule_ac",
+        "lh_ac_inputs",
+        "lh_ac_MSA",
+        "lh_ac_boltz2_input_yamls",
+        "lh_ac_boltz2_predictions",
+        "lh_ac_esmfold_input_jsons",
+        "lh_ac_esmfold_predictions",
+        "lh_ac_binding_scores",
+        "rule_ac_presentation",
+        "rule_ac_successful_designs_zip",
+    ],
     partitions_def=design_configs,
     description=(
-        "Score selected design partition(s) and export passing binders as FASTA. "
-        "Select partition(s) in the Launchpad, just like design_pipeline. "
-        "Materialize after ``boltz2_predictions`` and/or ``esmfold_predictions`` "
-        "have finished for every selected partition (at least one predictor required)."
+        "Score selected design partition(s), export Rule A/B/C filtered designs; "
+        "for Rule B successes run stationary glycan superimpose (zip), MD/GlycoSHIELD "
+        "ensemble glycan–binder clashes + LH off-target under ``lh_offtarget_b/`` + "
+        "Rule B Marp deck + presentation zip; "
+        "for Rule A/C gate on complete AF3 uploads, score AF3 specificity, run "
+        "stationary glycan superimpose + ensemble clashes + LH under ``lh_offtarget_ac/``, "
+        "build ``{run_id}/rule_ac/`` (``deck_rule_ac.md`` + ``deck_rule_ac.pdf``), then zip "
+        "presentation designs. Partitions without ``AF3/`` soft-skip the A/C track. "
+        "Select partition(s) in the Launchpad. Materialize after "
+        "``boltz2_predictions`` / ``boltz2_renumber`` and/or "
+        "``esmfold_predictions`` / ``esmfold_renumber`` have finished for every "
+        "selected partition (at least one predictor required)."
     ),
 )
 
@@ -104,12 +146,14 @@ sequence_pipeline_job = define_asset_job(
         "MSA",
         "boltz2_input_yamls",
         "boltz2_predictions",
+        "boltz2_renumber",
         "esmfold_input_jsons",
         "esmfold_predictions",
+        "esmfold_renumber",
     ],
     partitions_def=design_configs,
     description=(
-        "Run import → SoluProt → precomputed-MSA Boltz-2 + ESMFold for "
+        "Run import → SoluProt → precomputed-MSA Boltz-2 + ESMFold (and renumber) for "
         "``sequence_import`` partitions. "
         "Run ``register_sequences`` first (required upstream for import), then select "
         "the new ``{run_id}__seq__*`` partition(s) in the Launchpad."

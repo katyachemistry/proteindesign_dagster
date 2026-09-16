@@ -31,6 +31,7 @@ run writes to a fresh directory:
       esmfold/               ← ESMFold predictions
       esmfold_renumbered/    ← ESMFold with target chains renumbered to reference PDB
       boltz2/                ← Boltz-2 predictions (when run)
+      boltz2_renumbered/     ← Boltz-2 with target chains renumbered to reference PDB
 
 Partition key format
 --------------------
@@ -53,6 +54,7 @@ Docker notes
   and CUDA 13 NVRTC on ``LD_LIBRARY_PATH`` (see ``boltzgen_generation``).
 """
 
+import csv
 import json
 import os
 import shlex
@@ -75,6 +77,7 @@ from dagster import (
     asset,
 )
 from pydantic import Field, model_validator
+from tqdm import tqdm
 
 from dagster_pipeline.resources import (
     DEFAULT_BOLTZ2_CACHE_VOLUME,
@@ -97,6 +100,10 @@ from dagster_pipeline.resources import (
     ESMFoldToolConfig,
     FinalScoresToolConfig,
     FilteredDesignsToolConfig,
+    LhOfftargetConfig,
+    LhAcOfftargetConfig,
+    RuleBPresentationConfig,
+    RuleAcPresentationConfig,
     StructureFiltersToolConfig,
     _normalize_structure_filters_yaml,
 )
@@ -185,6 +192,14 @@ class PipelineAllToolsConfig(Config):
     esmfold: ESMFoldToolConfig = Field(default_factory=ESMFoldToolConfig)
     final_scores: FinalScoresToolConfig = Field(default_factory=FinalScoresToolConfig)
     filtered_designs: FilteredDesignsToolConfig = Field(default_factory=FilteredDesignsToolConfig)
+    lh_offtarget_b: LhOfftargetConfig = Field(default_factory=LhOfftargetConfig)
+    lh_offtarget_ac: LhAcOfftargetConfig = Field(default_factory=LhAcOfftargetConfig)
+    rule_b_presentation: RuleBPresentationConfig = Field(
+        default_factory=RuleBPresentationConfig
+    )
+    rule_ac_presentation: RuleAcPresentationConfig = Field(
+        default_factory=RuleAcPresentationConfig
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -238,7 +253,7 @@ class PipelineAllToolsConfig(Config):
             ),
             "proteinmpnn": ("fixed_positions_jsonl",),
             "msa": ("cache_dir",),
-            "boltz2": ("cache_volume", "no_kernels", "renumber_outputs"),
+            "boltz2": ("cache_volume", "no_kernels"),
             "esmfold": ("target_fasta", "predict_script", "hf_cache_dir"),
             "final_scores": ("boltz_subdir", "esmfold_subdir"),
         }
@@ -259,6 +274,12 @@ class PipelineAllToolsConfig(Config):
                     structure_filters.get("structure_docker_image", "")
                 ).strip():
                     structure_filters["structure_docker_image"] = legacy_image
+
+        # Older runs used ``lh_offtarget:``; prefer ``lh_offtarget_b:``.
+        if "lh_offtarget_b" not in data and isinstance(data.get("lh_offtarget"), dict):
+            data["lh_offtarget_b"] = data.pop("lh_offtarget")
+        else:
+            data.pop("lh_offtarget", None)
 
         return data
 
@@ -373,22 +394,54 @@ def _branch_status(has_candidates: bool) -> str:
     return "has_candidates" if has_candidates else "no_candidates"
 
 
-def _esmfold_target_fasta(pc: PipelineAllToolsConfig) -> str:
-    """Shared target epitope FASTA for ESMFold and Boltz-2."""
-    return str(pc.boltz2.target_fasta or "").strip()
+def _empty_branch_output(
+    context: AssetExecutionContext,
+    *,
+    reason: str,
+    branch_status: str = "no_candidates",
+    value: dict | None = None,
+    **extra_metadata,
+) -> Output:
+    """Materialize a no-op / empty branch so asset backfills clear requested partitions.
+
+    Assets that previously used ``output_required=False`` and bare ``return`` left
+    Dagster backfills stuck in REQUESTED forever (skipped steps never emit
+    ASSET_MATERIALIZATION). Always yield this instead of returning without output.
+    """
+    payload = {
+        "partition_key": context.partition_key,
+        "has_candidates": False,
+        **(value or {}),
+    }
+    return Output(
+        payload,
+        metadata={
+            "partition_key": context.partition_key,
+            "has_candidates": False,
+            "branch_status": branch_status,
+            "skip_reason": reason,
+            **extra_metadata,
+        },
+    )
 
 
-def _esmfold_fasta_extensions(pc: PipelineAllToolsConfig) -> tuple[str, ...]:
-    """Shared FASTA suffixes for ESMFold and Boltz-2."""
-    raw = list(pc.boltz2.fasta_extensions or [])
-    return tuple(e if e.startswith(".") else f".{e}" for e in raw)
-
-def _esmfold_predict_script() -> Path:
-    return (_PROTEINDESIGN / "ESMfold2" / "predict.py").resolve()
-
-
-def _esmfold_hf_cache_dir() -> Path:
-    return Path(DEFAULT_ESMFOLD2_HF_CACHE_DIR).resolve()
+def _empty_branch_result(
+    context: AssetExecutionContext,
+    *,
+    reason: str,
+    branch_status: str = "no_candidates",
+    **extra_metadata,
+) -> MaterializeResult:
+    """Same as ``_empty_branch_output`` for assets that return ``MaterializeResult``."""
+    return MaterializeResult(
+        metadata={
+            "partition_key": context.partition_key,
+            "has_candidates": False,
+            "branch_status": branch_status,
+            "skip_reason": reason,
+            **extra_metadata,
+        }
+    )
 
 
 def _renumber_predicted_structures(
@@ -714,6 +767,12 @@ def _merge_sequence_manifest(
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return manifest
 
+
+# ---------------------------------------------------------------------------
+# configs group  (non-partitioned seed asset)
+# ---------------------------------------------------------------------------
+
+
 def _yaml_preview(output_dir: Path) -> str:
     yamls = sorted(output_dir.glob("*.yaml"))
     if not yamls:
@@ -1009,10 +1068,6 @@ def _generate_promera_yamls(
     return manifest, total_files, preview_sections
 
 
-# ---------------------------------------------------------------------------
-# configs group  (non-partitioned seed asset)
-# ---------------------------------------------------------------------------
-
 @asset(
     group_name="configs",
     description=(
@@ -1250,7 +1305,8 @@ def register_sequence_partitions(
         "Import external binder FASTAs for one ``sequence_import`` partition. Requires "
         "``register_sequence_partitions`` to have run for the target run. Writes "
         "MPNN-style files to ``proteinmpnn/seqs/`` using sanitized protein names from "
-        "FASTA headers (one output file per sequence). Skipped for RFdiffusion partitions."
+        "FASTA headers (one output file per sequence). For non-sequence_import partitions, "
+        "materializes as skipped (not a Dagster skip) so asset backfills still complete."
     ),
 )
 def import_binder_sequences(
@@ -1261,7 +1317,12 @@ def import_binder_sequences(
     if not _is_sequence_import_partition(context, pc):
         context.log.info(
             f"[import_binder_sequences] partition={partition_key}  "
-            "not a sequence_import partition; skipping"
+            "not a sequence_import partition; materializing as skipped"
+        )
+        yield _empty_branch_output(
+            context,
+            reason="not a sequence_import partition",
+            branch_status="skipped",
         )
         return
 
@@ -1314,7 +1375,7 @@ def import_binder_sequences(
 
 
 # ---------------------------------------------------------------------------
-# Design generation + shared structure filter  (partitioned)
+# Design generation (partitioned)
 # ---------------------------------------------------------------------------
 
 @asset(
@@ -1686,6 +1747,10 @@ def promera_generation(
     )
 
 
+# ---------------------------------------------------------------------------
+# structure filter group 
+# ---------------------------------------------------------------------------
+
 @asset(
     group_name="design_filter",
     partitions_def=design_configs,
@@ -1892,8 +1957,9 @@ def _resolve_boltzgen_binder_sequence_file(
         "at least one design in ``pdbs_filtered/``. Parses PDBs into ``parsed_pdbs.jsonl`` "
         "and writes ``assigned_chains.jsonl``. For BoltzGen partitions, also writes "
         "``fixed_positions.jsonl`` from the design-fragment scaffold so non-designed "
-        "binder residues stay fixed during inverse folding. Skipped (not materialized) "
-        "when no designs passed the structure filter."
+        "binder residues stay fixed during inverse folding. When no designs passed the "
+        "structure filter (or this partition does not use ProteinMPNN), materializes "
+        "``branch_status=no_candidates`` / ``skipped`` so asset backfills complete."
     ),
 )
 def proteinmpnn_parsed(context: AssetExecutionContext):
@@ -1901,7 +1967,12 @@ def proteinmpnn_parsed(context: AssetExecutionContext):
     if _is_sequence_import_partition(context, pc):
         context.log.info(
             f"[proteinmpnn_parsed] partition={context.partition_key}  "
-            "sequence_import partition; skipping ProteinMPNN parse"
+            "sequence_import partition; materializing ProteinMPNN parse as skipped"
+        )
+        yield _empty_branch_output(
+            context,
+            reason="sequence_import partition",
+            branch_status="skipped",
         )
         return
 
@@ -1910,8 +1981,15 @@ def proteinmpnn_parsed(context: AssetExecutionContext):
     if tool == DESIGN_TOOL_PROMERA:
         context.log.info(
             f"[proteinmpnn_parsed] partition={context.partition_key}  "
-            "promera partition; skipping ProteinMPNN parse (promera already "
-            "did its own AbMPNN CDR redesign — see proteinmpnn_soluprot_filter)"
+            "promera partition; materializing ProteinMPNN parse as skipped "
+            "(promera already did its own AbMPNN CDR redesign — see "
+            "proteinmpnn_soluprot_filter)"
+        )
+        yield _empty_branch_output(
+            context,
+            reason="promera partition uses its own AbMPNN sequences",
+            branch_status="skipped",
+            tool=tool,
         )
         return
     mpnn = pc.proteinmpnn
@@ -1932,7 +2010,14 @@ def proteinmpnn_parsed(context: AssetExecutionContext):
     if not passed_pdbs:
         context.log.warning(
             f"[proteinmpnn_parsed] partition={context.partition_key}  "
-            f"no filtered PDBs in {pdbs_dir}; skipping ProteinMPNN branch"
+            f"no filtered PDBs in {pdbs_dir}; materializing empty ProteinMPNN branch"
+        )
+        yield _empty_branch_output(
+            context,
+            reason=f"no filtered PDBs in {pdbs_dir}",
+            value={"candidate_count": 0},
+            pdbs_dir=MetadataValue.path(str(pdbs_dir)),
+            candidate_count=0,
         )
         return
 
@@ -2050,8 +2135,10 @@ def proteinmpnn_parsed(context: AssetExecutionContext):
         "to the partition's ``proteinmpnn/seqs`` directory. "
         "Uses global ``proteinmpnn.omit_AAs``, merged with ``proteinmpnn.omit_AA`` "
         "when a scaffold key appears in the partition / design name. "
-        "Skipped for ``sequence_import`` and ``promera`` partitions (promera's own "
-        "AbMPNN sequence is imported directly in ``proteinmpnn_soluprot_filter``)."
+        "For ``sequence_import`` / ``promera`` partitions, or when "
+        "``proteinmpnn_parsed`` left no candidates, materializes "
+        "``branch_status=skipped`` / ``no_candidates`` (promera / sequence_import "
+        "sequences are imported in ``proteinmpnn_soluprot_filter``)."
     ),
 )
 def proteinmpnn_sequences(
@@ -2061,7 +2148,12 @@ def proteinmpnn_sequences(
     if _is_sequence_import_partition(context, pc):
         context.log.info(
             f"[proteinmpnn_sequences] partition={context.partition_key}  "
-            "sequence_import partition; skipping ProteinMPNN"
+            "sequence_import partition; materializing ProteinMPNN as skipped"
+        )
+        yield _empty_branch_output(
+            context,
+            reason="sequence_import partition",
+            branch_status="skipped",
         )
         return
 
@@ -2069,7 +2161,13 @@ def proteinmpnn_sequences(
     if str(entry.get("tool") or "") == DESIGN_TOOL_PROMERA:
         context.log.info(
             f"[proteinmpnn_sequences] partition={context.partition_key}  "
-            "promera partition; skipping ProteinMPNN (uses its own AbMPNN sequence)"
+            "promera partition; materializing ProteinMPNN as skipped "
+            "(uses its own AbMPNN sequence)"
+        )
+        yield _empty_branch_output(
+            context,
+            reason="promera partition uses its own AbMPNN sequences",
+            branch_status="skipped",
         )
         return
     mpnn = pc.proteinmpnn
@@ -2086,6 +2184,20 @@ def proteinmpnn_sequences(
     )
 
     mpnn_dir = _partition_root(_run_outputs_dir(pc), context.partition_key, pc.run_id) / "proteinmpnn"
+    parsed_jsonl = mpnn_dir / "parsed_pdbs.jsonl"
+    if not parsed_jsonl.is_file():
+        context.log.warning(
+            f"[proteinmpnn_sequences] partition={context.partition_key}  "
+            f"no {parsed_jsonl.name}; materializing empty ProteinMPNN sequences"
+        )
+        yield _empty_branch_output(
+            context,
+            reason=f"missing {parsed_jsonl}",
+            value={"fasta_count": 0},
+            fasta_count=0,
+        )
+        return
+
     context.log.info(
         f"[proteinmpnn_sequences] partition={context.partition_key}  "
         f"num_seq_per_target={mpnn.num_seq_per_target}  sampling_temp={mpnn.sampling_temp}  "
@@ -2144,9 +2256,12 @@ def proteinmpnn_sequences(
     description=(
         "Run SoluProt on binder sequences in ``proteinmpnn/seqs/`` and write passing "
         "FASTAs to ``proteinmpnn/seqs_filtered/``. Always materializes a filter summary; "
-        "when ``soluprot.enabled`` is false, copies ``seqs/`` unchanged. Downstream "
-        "Boltz-2 steps are skipped when no sequences pass. For ``sequence_import`` "
-        "partitions, auto-imports from the manifest FASTA when ``seqs/`` is empty."
+        "when ``soluprot.enabled`` is false, copies ``seqs/`` unchanged. When no "
+        "sequences are available or none pass, still materializes "
+        "``branch_status=no_candidates`` (downstream Boltz-2 / ESMFold assets then "
+        "materialize empty rather than leaving a backfill hanging). For "
+        "``sequence_import`` partitions, auto-imports from the manifest FASTA when "
+        "``seqs/`` is empty."
     ),
 )
 def proteinmpnn_soluprot_filter(
@@ -2184,12 +2299,25 @@ def proteinmpnn_soluprot_filter(
         import_promera_fasta_to_mpnn_seqs(designs_dir, pdbs_filtered_dir, seq_dir)
 
     if not seq_dir.is_dir() or not list_mpnn_fasta_files(seq_dir, exts):
-        raise Failure(
-            description=(
-                f"ProteinMPNN sequence directory missing or empty for partition "
-                f"{context.partition_key!r}: {seq_dir}. proteinmpnn_sequences may not "
-                "have materialized."
-            )
+        context.log.warning(
+            f"[proteinmpnn_soluprot_filter] partition={context.partition_key}  "
+            f"no sequences in {seq_dir}; materializing empty SoluProt result"
+        )
+        if filtered_dir.exists():
+            shutil.rmtree(filtered_dir)
+        filtered_dir.mkdir(parents=True, exist_ok=True)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        return _empty_branch_result(
+            context,
+            reason=f"ProteinMPNN sequence directory missing or empty: {seq_dir}",
+            enabled=sp.enabled,
+            seq_dir=MetadataValue.path(str(seq_dir)),
+            filtered_dir=MetadataValue.path(str(filtered_dir)),
+            work_dir=MetadataValue.path(str(work_dir)),
+            input_sequence_count=0,
+            passed_sequence_count=0,
+            failed_sequence_count=0,
+            output_fasta_count=0,
         )
 
     context.log.info(
@@ -2249,8 +2377,8 @@ def proteinmpnn_soluprot_filter(
     if not has_candidates:
         context.log.warning(
             f"[proteinmpnn_soluprot_filter] partition={context.partition_key}  "
-            f"no sequences passed SoluProt; Boltz-2 and ESMFold branches will be skipped. "
-            f"See {work_dir / 'soluprot_filter_summary.json'}."
+            f"no sequences passed SoluProt; downstream Boltz-2 / ESMFold assets will "
+            f"materialize as no_candidates. See {work_dir / 'soluprot_filter_summary.json'}."
         )
 
     context.log.info(
@@ -2289,7 +2417,8 @@ def proteinmpnn_soluprot_filter(
     description=(
         "Precomputes Boltz-2 paired and unpaired MSAs after SoluProt filtering. "
         "Unpaired searches are shared globally by sequence checksum; paired searches "
-        "are cached by the ordered complex. ESMFold does not depend on this asset."
+        "are cached by the ordered complex. ESMFold does not depend on this asset. "
+        "When ``seqs_filtered/`` is empty, materializes ``branch_status=no_candidates``."
     ),
 )
 def MSA(context: AssetExecutionContext):
@@ -2308,17 +2437,31 @@ def MSA(context: AssetExecutionContext):
 
     exts = tuple(e if e.startswith(".") else f".{e}" for e in bz.fasta_extensions)
     if not seq_dir.is_dir():
-        raise Failure(
-            description=(
-                f"SoluProt filtered sequence directory missing for partition "
-                f"{context.partition_key!r}: {seq_dir}."
-            )
+        context.log.warning(
+            f"[MSA] partition={context.partition_key} missing {seq_dir}; "
+            "materializing empty Boltz-2 MSA branch"
         )
+        yield _empty_branch_output(
+            context,
+            reason=f"SoluProt filtered sequence directory missing: {seq_dir}",
+            value={"complex_count": 0, "chain_count": 0},
+            complex_count=0,
+            chain_count=0,
+        )
+        return
     files = sorted(p for p in seq_dir.iterdir() if p.is_file() and p.suffix.lower() in exts)
     if not files:
         context.log.warning(
             f"[MSA] partition={context.partition_key} no FASTAs in "
-            f"{seq_dir}; skipping Boltz-2 branch"
+            f"{seq_dir}; materializing empty Boltz-2 MSA branch"
+        )
+        yield _empty_branch_output(
+            context,
+            reason=f"no FASTAs in {seq_dir}",
+            value={"complex_count": 0, "chain_count": 0},
+            complex_count=0,
+            chain_count=0,
+            seq_dir=MetadataValue.path(str(seq_dir)),
         )
         return
 
@@ -2336,7 +2479,15 @@ def MSA(context: AssetExecutionContext):
     if not complexes:
         context.log.warning(
             f"[MSA] partition={context.partition_key} no binder records in "
-            f"{seq_dir}; skipping Boltz-2 branch"
+            f"{seq_dir}; materializing empty Boltz-2 MSA branch"
+        )
+        yield _empty_branch_output(
+            context,
+            reason=f"no binder records in {seq_dir}",
+            value={"complex_count": 0, "chain_count": 0},
+            complex_count=0,
+            chain_count=0,
+            seq_dir=MetadataValue.path(str(seq_dir)),
         )
         return
 
@@ -2359,17 +2510,46 @@ def MSA(context: AssetExecutionContext):
         f"unique_chains={len(set(sequence for item in complexes for _, sequence in item.chains))} "
         f"server={msa_config.server_url} cache={DEFAULT_MSA_CACHE_DIR}"
     )
-    manifest = build_boltz_msa_bundle(
-        complexes,
-        output_dir=msa_dir,
-        cache_root=Path(DEFAULT_MSA_CACHE_DIR),
-        client=client,
-        unpaired_mode=unpaired_mode,
-        paired_mode=paired_mode,
-        use_env=msa_config.use_env,
-        max_paired_seqs=msa_config.max_paired_seqs,
-        max_msa_seqs=msa_config.max_msa_seqs,
+    unique_sequences = list(
+        dict.fromkeys(sequence for item in complexes for _, sequence in item.chains)
     )
+    msa_total = len(unique_sequences) + len(complexes)
+
+    # tqdm uses \\r redraws; emit each refresh as a full line so Dagster's
+    # line-oriented compute log (same path as other stdout) can show progress.
+    class _TqdmStdout:
+        def write(self, s: str) -> int:
+            if not s:
+                return 0
+            text = s.replace("\r", "\n").rstrip("\n")
+            if text:
+                print(text, flush=True)
+            return len(s)
+
+        def flush(self) -> None:
+            sys.stdout.flush()
+
+    with tqdm(
+        total=msa_total,
+        desc=f"MSA {context.partition_key}",
+        unit="msa",
+        file=_TqdmStdout(),
+        dynamic_ncols=True,
+        mininterval=0.5,
+        ascii=True,
+    ) as pbar:
+        manifest = build_boltz_msa_bundle(
+            complexes,
+            output_dir=msa_dir,
+            cache_root=Path(DEFAULT_MSA_CACHE_DIR),
+            client=client,
+            unpaired_mode=unpaired_mode,
+            paired_mode=paired_mode,
+            use_env=msa_config.use_env,
+            max_paired_seqs=msa_config.max_paired_seqs,
+            max_msa_seqs=msa_config.max_msa_seqs,
+            on_msa_done=pbar.update,
+        )
     manifest_complexes = manifest["complexes"]
     chain_count = sum(len(item["chains"]) for item in manifest_complexes.values())
     yield Output(
@@ -2398,9 +2578,10 @@ def MSA(context: AssetExecutionContext):
     output_required=False,
     description=(
         "Writes Boltz-2 ``predict`` input YAMLs to ``proteinmpnn/combined_yamls`` when "
-        "the MSA asset produced precomputed per-chain CSVs. Skipped when no "
-        "sequences passed. ``boltz2.target_fasta``, ``boltz2.fasta_extensions``, and "
-        "``boltz2.template_yaml`` are read from the run-scoped config."
+        "the MSA asset produced precomputed per-chain CSVs. When no sequences passed, "
+        "materializes ``branch_status=no_candidates``. ``boltz2.target_fasta``, "
+        "``boltz2.fasta_extensions``, and ``boltz2.template_yaml`` are read from the "
+        "run-scoped config."
     ),
 )
 def boltz2_input_yamls(context: AssetExecutionContext):
@@ -2422,6 +2603,36 @@ def boltz2_input_yamls(context: AssetExecutionContext):
         raise Failure(description=f"Boltz-2 template YAML not found: {template_path}")
 
     template_text = template_path.read_text(encoding="utf-8")
+    exts = tuple(e if e.startswith(".") else f".{e}" for e in bz.fasta_extensions)
+    if not seq_dir.is_dir():
+        context.log.warning(
+            f"[boltz2_input_yamls] partition={context.partition_key}  "
+            f"missing {seq_dir}; materializing empty Boltz-2 YAML branch"
+        )
+        yield _empty_branch_output(
+            context,
+            reason=f"SoluProt filtered sequence directory missing: {seq_dir}",
+            value={"source_fasta_count": 0, "yaml_files_written": 0},
+            source_fastas=0,
+            yaml_files_written=0,
+        )
+        return
+    files = sorted(p for p in seq_dir.iterdir() if p.is_file() and p.suffix.lower() in exts)
+    if not files:
+        context.log.warning(
+            f"[boltz2_input_yamls] partition={context.partition_key}  "
+            f"no FASTAs in {seq_dir}; materializing empty Boltz-2 YAML branch"
+        )
+        yield _empty_branch_output(
+            context,
+            reason=f"no FASTAs in {seq_dir}",
+            value={"source_fasta_count": 0, "yaml_files_written": 0},
+            source_fastas=0,
+            yaml_files_written=0,
+            seq_dir=MetadataValue.path(str(seq_dir)),
+        )
+        return
+
     msa_manifest_path = msa_dir / "manifest.json"
     if not msa_manifest_path.is_file():
         raise Failure(
@@ -2434,22 +2645,6 @@ def boltz2_input_yamls(context: AssetExecutionContext):
     manifest_complexes = msa_manifest.get("complexes")
     if not isinstance(manifest_complexes, dict):
         raise Failure(description=f"Invalid Boltz-2 MSA manifest: {msa_manifest_path}")
-    exts = tuple(e if e.startswith(".") else f".{e}" for e in bz.fasta_extensions)
-    if not seq_dir.is_dir():
-        raise Failure(
-            description=(
-                f"SoluProt filtered sequence directory missing for partition "
-                f"{context.partition_key!r}: {seq_dir}."
-            )
-        )
-    files = sorted(p for p in seq_dir.iterdir() if p.is_file() and p.suffix.lower() in exts)
-    if not files:
-        context.log.warning(
-            f"[boltz2_input_yamls] partition={context.partition_key}  "
-            f"no FASTAs in {seq_dir}; skipping Boltz-2 branch"
-        )
-        return
-
     if yaml_dir.exists():
         shutil.rmtree(yaml_dir)
     yaml_dir.mkdir(parents=True, exist_ok=True)
@@ -2531,9 +2726,8 @@ def boltz2_input_yamls(context: AssetExecutionContext):
     deps=[boltz2_input_yamls],
     description=(
         "Runs Boltz-2 structure predictions for one partition using input YAMLs from "
-        "``proteinmpnn/combined_yamls``, writes results to ``boltz2/``, then optionally "
-        "renumbers target chains to match ``boltz2.target_pdb`` from the run-scoped "
-        "``pipeline_config.yaml`` into ``boltz2_renumbered/``. "
+        "``proteinmpnn/combined_yamls``, writes results to ``boltz2/``. "
+        "Target-chain renumbering is a separate ``boltz2_renumber`` asset. "
         "Parameters are read from the run-scoped ``pipeline_config.yaml``."
     ),
 )
@@ -2549,12 +2743,16 @@ def boltz2_predictions(
 
     yaml_files = sorted(yaml_dir.glob("*.yaml")) if yaml_dir.is_dir() else []
     if not yaml_files:
-        raise Failure(
-            description=(
-                f"Boltz-2 YAML input directory missing or empty for partition "
-                f"{context.partition_key!r}: {yaml_dir}. boltz2_input_yamls may not "
-                "have materialized."
-            )
+        context.log.warning(
+            f"[boltz2_predictions] partition={context.partition_key}  "
+            f"no YAMLs in {yaml_dir}; materializing empty Boltz-2 predictions"
+        )
+        return _empty_branch_result(
+            context,
+            reason=f"Boltz-2 YAML input directory missing or empty: {yaml_dir}",
+            predictions_dir=MetadataValue.path(str(out_dir)),
+            input_yaml_count=0,
+            structure_file_count=0,
         )
 
     chunk_size = bz.query_chunk_size if bz.query_chunk_size > 0 else len(yaml_files)
@@ -2630,35 +2828,6 @@ def boltz2_predictions(
             "Check the Boltz-2 log for errors."
         )
 
-    structure_tools_enabled = pc.structure_filters.enabled
-    renumber_skipped = not structure_tools_enabled
-    renumbered_dir: Optional[Path] = None
-    renumbered_structure_count = 0
-    mapping_path: Optional[Path] = None
-    target_pdb = ""
-
-    if renumber_skipped:
-        if not structure_tools_enabled:
-            context.log.info(
-                "[boltz2_predictions] structure_filters.enabled=false — skipping renumbering"
-            )
-    else:
-        target_pdb = _pipeline_target_pdb(pc)
-        if not Path(bz.target_fasta).is_file():
-            raise FileNotFoundError(f"Boltz-2 target FASTA not found: {bz.target_fasta}")
-
-        renumbered_dir = proot / "boltz2_renumbered"
-        renumbered_structure_count, mapping_path = _renumber_predicted_structures(
-            context,
-            pc,
-            proot=proot,
-            target_pdb=target_pdb,
-            target_fasta=bz.target_fasta,
-            input_dir=out_dir,
-            output_dir=renumbered_dir,
-            log_label="boltz2_predictions",
-        )
-
     return MaterializeResult(
         metadata={
             "predictions_dir": MetadataValue.path(str(out_dir)),
@@ -2671,33 +2840,106 @@ def boltz2_predictions(
             "diffusion_samples": bz.diffusion_samples,
             "devices": bz.devices,
             "msa_source": "precomputed",
-            "renumber_skipped": renumber_skipped,
-            "target_pdb": MetadataValue.path(target_pdb) if target_pdb else "",
-            "target_fasta": MetadataValue.path(bz.target_fasta) if not renumber_skipped else "",
-            "renumbered_dir": MetadataValue.path(str(renumbered_dir)) if renumbered_dir else "",
+        }
+    )
+
+
+@asset(
+    group_name="boltz2",
+    partitions_def=design_configs,
+    deps=[boltz2_predictions],
+    description=(
+        "Renumbers Boltz-2 target chains in ``boltz2/`` to match ``boltz2.target_pdb`` "
+        "from the run-scoped ``pipeline_config.yaml``, writing ``boltz2_renumbered/``. "
+        "Uses ``structure_filters.structure_docker_image``; gated by "
+        "``boltz2.renumber_outputs`` (independent of ``structure_filters.enabled``)."
+    ),
+)
+def boltz2_renumber(
+    context: AssetExecutionContext,
+) -> MaterializeResult:
+    pc = _read_pipeline_config(partition_key=context.partition_key)
+    proot = _partition_root(_run_outputs_dir(pc), context.partition_key, pc.run_id)
+    bz = pc.boltz2
+    input_dir = proot / "boltz2"
+    renumbered_dir = proot / "boltz2_renumbered"
+
+    if not bz.renumber_outputs:
+        context.log.info("[boltz2_renumber] boltz2.renumber_outputs=false — skipping")
+        return _empty_branch_result(
+            context,
+            reason="boltz2.renumber_outputs=false",
+            branch_status="skipped",
+            predictions_dir=MetadataValue.path(str(input_dir)),
+            renumbered_dir=MetadataValue.path(str(renumbered_dir)),
+            renumbered_structure_file_count=0,
+            structure_docker_image=pc.structure_filters.structure_docker_image,
+        )
+
+    structure_files = list(input_dir.rglob("*.cif")) + list(input_dir.rglob("*.pdb"))
+    if not structure_files:
+        context.log.warning(
+            f"[boltz2_renumber] no structures in {input_dir}; materializing empty renumber"
+        )
+        return _empty_branch_result(
+            context,
+            reason=f"Boltz-2 predictions directory missing or empty: {input_dir}",
+            predictions_dir=MetadataValue.path(str(input_dir)),
+            renumbered_dir=MetadataValue.path(str(renumbered_dir)),
+            renumbered_structure_file_count=0,
+            structure_docker_image=pc.structure_filters.structure_docker_image,
+        )
+
+    target_pdb = _pipeline_target_pdb(pc)
+    if not Path(bz.target_fasta).is_file():
+        raise FileNotFoundError(f"Boltz-2 target FASTA not found: {bz.target_fasta}")
+
+    renumbered_structure_count, mapping_path = _renumber_predicted_structures(
+        context,
+        pc,
+        proot=proot,
+        target_pdb=target_pdb,
+        target_fasta=bz.target_fasta,
+        input_dir=input_dir,
+        output_dir=renumbered_dir,
+        log_label="boltz2_renumber",
+    )
+
+    return MaterializeResult(
+        metadata={
+            "predictions_dir": MetadataValue.path(str(input_dir)),
+            "renumbered_dir": MetadataValue.path(str(renumbered_dir)),
             "renumbered_structure_file_count": renumbered_structure_count,
+            "target_pdb": MetadataValue.path(target_pdb),
+            "target_fasta": MetadataValue.path(bz.target_fasta),
             "mapping_path": MetadataValue.path(str(mapping_path)) if mapping_path else "",
-            "structure_filters_enabled": structure_tools_enabled,
             "structure_docker_image": pc.structure_filters.structure_docker_image,
         }
     )
 
 
-def _final_scores_boltz_subdir(proot: Path) -> str:
-    if (proot / "boltz2_renumbered").is_dir():
-        return "boltz2_renumbered"
-    return "boltz2"
-
-
-def _final_scores_esmfold_subdir(proot: Path) -> str:
-    if (proot / "esmfold_renumbered").is_dir():
-        return "esmfold_renumbered"
-    return "esmfold"
-
-
 # ---------------------------------------------------------------------------
 # esmfold group  (partitioned; JSON inputs after SoluProt)
 # ---------------------------------------------------------------------------
+
+def _esmfold_target_fasta(pc: PipelineAllToolsConfig) -> str:
+    """Shared target epitope FASTA for ESMFold and Boltz-2."""
+    return str(pc.boltz2.target_fasta or "").strip()
+
+
+def _esmfold_fasta_extensions(pc: PipelineAllToolsConfig) -> tuple[str, ...]:
+    """Shared FASTA suffixes for ESMFold and Boltz-2."""
+    raw = list(pc.boltz2.fasta_extensions or [])
+    return tuple(e if e.startswith(".") else f".{e}" for e in raw)
+
+
+def _esmfold_predict_script() -> Path:
+    return (_PROTEINDESIGN / "ESMfold2" / "predict.py").resolve()
+
+
+def _esmfold_hf_cache_dir() -> Path:
+    return Path(DEFAULT_ESMFOLD2_HF_CACHE_DIR).resolve()
+
 
 @asset(
     group_name="esmfold",
@@ -2707,7 +2949,8 @@ def _final_scores_esmfold_subdir(proot: Path) -> str:
     description=(
         "Builds ESMFold2 ``StructurePredictionInput`` JSON files in "
         "``proteinmpnn/esmfold_inputs`` when SoluProt filtering left sequences in "
-        "``seqs_filtered/``. Skipped when no sequences passed. "
+        "``seqs_filtered/``. When no sequences passed, materializes "
+        "``branch_status=no_candidates``. "
         "ESMFold shares ``boltz2.target_fasta`` and ``boltz2.fasta_extensions``."
     ),
 )
@@ -2728,17 +2971,31 @@ def esmfold_input_jsons(context: AssetExecutionContext):
 
     exts = _esmfold_fasta_extensions(pc)
     if not seq_dir.is_dir():
-        raise Failure(
-            description=(
-                f"SoluProt filtered sequence directory missing for partition "
-                f"{context.partition_key!r}: {seq_dir}."
-            )
+        context.log.warning(
+            f"[esmfold_input_jsons] partition={context.partition_key}  "
+            f"missing {seq_dir}; materializing empty ESMFold input branch"
         )
+        yield _empty_branch_output(
+            context,
+            reason=f"SoluProt filtered sequence directory missing: {seq_dir}",
+            value={"source_fasta_count": 0, "files_written": 0},
+            source_fastas=0,
+            files_written=0,
+        )
+        return
     files = sorted(p for p in seq_dir.iterdir() if p.is_file() and p.suffix.lower() in exts)
     if not files:
         context.log.warning(
             f"[esmfold_input_jsons] partition={context.partition_key}  "
-            f"no FASTAs in {seq_dir}; skipping ESMFold branch"
+            f"no FASTAs in {seq_dir}; materializing empty ESMFold input branch"
+        )
+        yield _empty_branch_output(
+            context,
+            reason=f"no FASTAs in {seq_dir}",
+            value={"source_fasta_count": 0, "files_written": 0},
+            source_fastas=0,
+            files_written=0,
+            seq_dir=MetadataValue.path(str(seq_dir)),
         )
         return
 
@@ -2780,8 +3037,8 @@ def esmfold_input_jsons(context: AssetExecutionContext):
     description=(
         "Runs ESMFold2 structure predictions for one partition using JSON inputs from "
         "``proteinmpnn/esmfold_inputs``. Uses ``ESMfold2/predict.py`` to write mmCIF plus "
-        "PAE/confidence sidecars under ``esmfold/``, then optionally renumbers target "
-        "chains to match ``boltz2.target_pdb`` into ``esmfold_renumbered/``. "
+        "PAE/confidence sidecars under ``esmfold/``. Target-chain renumbering is a "
+        "separate ``esmfold_renumber`` asset. "
         "Parameters are read from the run-scoped ``pipeline_config.yaml``."
     ),
 )
@@ -2797,12 +3054,16 @@ def esmfold_predictions(
 
     query_files = sorted(json_dir.glob("*.json"))
     if not query_files:
-        raise Failure(
-            description=(
-                f"ESMFold2 JSON input directory missing or empty for partition "
-                f"{context.partition_key!r}: {json_dir}. esmfold_input_jsons may "
-                "not have materialized."
-            )
+        context.log.warning(
+            f"[esmfold_predictions] partition={context.partition_key}  "
+            f"no JSONs in {json_dir}; materializing empty ESMFold predictions"
+        )
+        return _empty_branch_result(
+            context,
+            reason=f"ESMFold2 JSON input directory missing or empty: {json_dir}",
+            predictions_dir=MetadataValue.path(str(out_dir)),
+            input_json_count=0,
+            cif_file_count=0,
         )
 
     chunk_size = ef.query_chunk_size if ef.query_chunk_size > 0 else len(query_files)
@@ -2886,38 +3147,6 @@ def esmfold_predictions(
             "Check the ESMFold2 log for errors."
         )
 
-    structure_tools_enabled = pc.structure_filters.enabled
-    renumber_skipped = not ef.renumber_outputs or not structure_tools_enabled
-    renumbered_dir: Optional[Path] = None
-    renumbered_structure_count = 0
-    mapping_path: Optional[Path] = None
-    target_pdb = ""
-    target_fasta = _esmfold_target_fasta(pc)
-
-    if renumber_skipped:
-        if not structure_tools_enabled:
-            context.log.info(
-                "[esmfold_predictions] structure_filters.enabled=false — skipping renumbering"
-            )
-        else:
-            context.log.info("[esmfold_predictions] renumber_outputs=false — skipping renumbering")
-    else:
-        target_pdb = _pipeline_target_pdb(pc)
-        if not Path(target_fasta).is_file():
-            raise FileNotFoundError(f"ESMFold target FASTA not found: {target_fasta}")
-
-        renumbered_dir = proot / "esmfold_renumbered"
-        renumbered_structure_count, mapping_path = _renumber_predicted_structures(
-            context,
-            pc,
-            proot=proot,
-            target_pdb=target_pdb,
-            target_fasta=target_fasta,
-            input_dir=out_dir,
-            output_dir=renumbered_dir,
-            log_label="esmfold_predictions",
-        )
-
     return MaterializeResult(
         metadata={
             "predictions_dir": MetadataValue.path(str(out_dir)),
@@ -2937,13 +3166,80 @@ def esmfold_predictions(
             "docker_image": ef.docker_image,
             "hf_cache_dir": MetadataValue.path(hf_cache_str),
             "partition_root": MetadataValue.path(proot_str),
-            "renumber_skipped": renumber_skipped,
-            "target_pdb": MetadataValue.path(target_pdb) if target_pdb else "",
-            "target_fasta": MetadataValue.path(target_fasta) if not renumber_skipped else "",
-            "renumbered_dir": MetadataValue.path(str(renumbered_dir)) if renumbered_dir else "",
+        }
+    )
+
+
+@asset(
+    group_name="esmfold",
+    partitions_def=design_configs,
+    deps=[esmfold_predictions],
+    description=(
+        "Renumbers ESMFold target chains in ``esmfold/`` to match ``boltz2.target_pdb`` "
+        "from the run-scoped ``pipeline_config.yaml``, writing ``esmfold_renumbered/``. "
+        "Uses ``structure_filters.structure_docker_image``; gated by "
+        "``esmfold.renumber_outputs`` (independent of ``structure_filters.enabled``)."
+    ),
+)
+def esmfold_renumber(
+    context: AssetExecutionContext,
+) -> MaterializeResult:
+    pc = _read_pipeline_config(partition_key=context.partition_key)
+    proot = _partition_root(_run_outputs_dir(pc), context.partition_key, pc.run_id)
+    ef = pc.esmfold
+    input_dir = proot / "esmfold"
+    renumbered_dir = proot / "esmfold_renumbered"
+    target_fasta = _esmfold_target_fasta(pc)
+
+    if not ef.renumber_outputs:
+        context.log.info("[esmfold_renumber] esmfold.renumber_outputs=false — skipping")
+        return _empty_branch_result(
+            context,
+            reason="esmfold.renumber_outputs=false",
+            branch_status="skipped",
+            predictions_dir=MetadataValue.path(str(input_dir)),
+            renumbered_dir=MetadataValue.path(str(renumbered_dir)),
+            renumbered_structure_file_count=0,
+            structure_docker_image=pc.structure_filters.structure_docker_image,
+        )
+
+    cif_files = list(input_dir.glob("*.cif"))
+    if not cif_files:
+        context.log.warning(
+            f"[esmfold_renumber] no CIFs in {input_dir}; materializing empty renumber"
+        )
+        return _empty_branch_result(
+            context,
+            reason=f"ESMFold predictions directory missing or empty: {input_dir}",
+            predictions_dir=MetadataValue.path(str(input_dir)),
+            renumbered_dir=MetadataValue.path(str(renumbered_dir)),
+            renumbered_structure_file_count=0,
+            structure_docker_image=pc.structure_filters.structure_docker_image,
+        )
+
+    target_pdb = _pipeline_target_pdb(pc)
+    if not Path(target_fasta).is_file():
+        raise FileNotFoundError(f"ESMFold target FASTA not found: {target_fasta}")
+
+    renumbered_structure_count, mapping_path = _renumber_predicted_structures(
+        context,
+        pc,
+        proot=proot,
+        target_pdb=target_pdb,
+        target_fasta=target_fasta,
+        input_dir=input_dir,
+        output_dir=renumbered_dir,
+        log_label="esmfold_renumber",
+    )
+
+    return MaterializeResult(
+        metadata={
+            "predictions_dir": MetadataValue.path(str(input_dir)),
+            "renumbered_dir": MetadataValue.path(str(renumbered_dir)),
             "renumbered_structure_file_count": renumbered_structure_count,
+            "target_pdb": MetadataValue.path(target_pdb),
+            "target_fasta": MetadataValue.path(target_fasta),
             "mapping_path": MetadataValue.path(str(mapping_path)) if mapping_path else "",
-            "structure_filters_enabled": structure_tools_enabled,
             "structure_docker_image": pc.structure_filters.structure_docker_image,
         }
     )
@@ -2953,15 +3249,29 @@ def esmfold_predictions(
 # final_scores group  (partitioned)
 # ---------------------------------------------------------------------------
 
+def _final_scores_boltz_subdir(proot: Path) -> str:
+    if (proot / "boltz2_renumbered").is_dir():
+        return "boltz2_renumbered"
+    return "boltz2"
+
+
+def _final_scores_esmfold_subdir(proot: Path) -> str:
+    if (proot / "esmfold_renumbered").is_dir():
+        return "esmfold_renumbered"
+    return "esmfold"
+
+
 @asset(
     group_name="final_scores",
     partitions_def=design_configs,
     description=(
         "Runs developability metrics for one selected design partition. "
         "Writes ``{partition}/final_scores/metrics.csv`` with parallel ``_boltz`` and "
-        "``_esmfold`` metric columns. Requires at least one of ``boltz2_predictions`` or "
-        "``esmfold_predictions`` outputs for the partition; missing predictor columns are "
-        "filled with placeholders."
+        "``_esmfold`` metric columns. First screens ``specificity_hotspots`` (B68/B77); "
+        "if every Boltz and ESMFold model for an MPNN sequence is 0, skips Rosetta / "
+        "IPSAE / RMSD for that sequence and continues. Requires at least one of "
+        "``boltz2_predictions`` or ``esmfold_predictions``; prefers ``*_renumbered/`` "
+        "when present. Missing predictor columns are filled with placeholders."
     ),
 )
 def final_scores_metrics(context: AssetExecutionContext) -> MaterializeResult:
@@ -3041,10 +3351,12 @@ def final_scores_metrics(context: AssetExecutionContext) -> MaterializeResult:
     partitions_def=design_configs,
     deps=[final_scores_metrics],
     description=(
-        "Apply developability thresholds from ``pyrosetta_thresholds.json`` "
-        "(Filter_analysis.ipynb) to ``final_scores/metrics.csv`` and write one binder "
-        "FASTA per passing design under ``filtered_designs/``. Filenames encode "
-        "``{mpnn_seq_id}_model_{model_index}``."
+        "Select MPNN sequences from ``final_scores/metrics.csv`` via specificity-hotspot "
+        "consensus rules (Rules A/B/C), write Rule A/C metrics to "
+        "``filtered_designs/filtered_metrics_rule_ac.csv``, Rule B metrics to "
+        "``filtered_designs/filtered_metrics_rule_b.csv`` (plus combined "
+        "``filtered_metrics.csv``), and write Rule A/C binder+target AF3 Server jobs to "
+        "``filtered_designs/for_AF3.json``."
     ),
 )
 def filtered_designs_export(context: AssetExecutionContext) -> MaterializeResult:
@@ -3074,11 +3386,16 @@ def filtered_designs_export(context: AssetExecutionContext) -> MaterializeResult
             )
         )
 
+    # Repo-root package (filters/) — re-assert path in case a run worker dropped it.
+    if str(_PROTEINDESIGN) not in sys.path:
+        sys.path.insert(0, str(_PROTEINDESIGN))
     from filters.final_scores.filter_designs import FilterConfig, filter_partition_designs
 
     context.log.info(
         f"[filtered_designs_export] partition={context.partition_key}  "
-        f"metrics={metrics_csv}  thresholds={fd.thresholds_json}  predictor={fd.predictor}"
+        f"metrics={metrics_csv}  "
+        f"specificity_hotspots_required={fd.specificity_hotspots_required}  "
+        f"min_parent_successes={fd.min_parent_successes}"
     )
 
     summary = filter_partition_designs(
@@ -3086,35 +3403,1049 @@ def filtered_designs_export(context: AssetExecutionContext) -> MaterializeResult
         metrics_csv=metrics_csv,
         output_dir=out_dir,
         config=FilterConfig(
-            thresholds_json=Path(fd.thresholds_json),
-            predictor=fd.predictor,
-            min_hotspot_contact_fraction=fd.min_hotspot_contact_fraction,
-            max_binder_seq_len=fd.max_binder_seq_len,
-            min_interface_hbonds=fd.min_interface_hbonds,
-            skip_dg_threshold=fd.skip_dg_threshold,
+            specificity_hotspots_required=fd.specificity_hotspots_required,
+            min_parent_successes=fd.min_parent_successes,
+            min_seq_successes_fallback=fd.min_seq_successes_fallback,
+            min_good_binder_scores=fd.min_good_binder_scores,
+            max_binder_score=fd.max_binder_score,
+            rule_b_min_each=fd.rule_b_min_each,
+            rule_b_min_minor=fd.rule_b_min_minor,
+            rule_b_min_major=fd.rule_b_min_major,
         ),
     )
 
-    if summary["passed_count"] == 0:
+    if summary["passed_sequences"] == 0:
         context.log.warning(
             f"No designs passed filters for partition {context.partition_key!r}. "
             f"See {summary['summary_path']}."
         )
 
-    fasta_files = sorted(out_dir.glob("*.fasta"))
     return MaterializeResult(
         metadata={
             "partition_key": context.partition_key,
             "partition_root": MetadataValue.path(str(proot)),
             "metrics_csv": MetadataValue.path(str(metrics_csv)),
             "output_dir": MetadataValue.path(str(out_dir)),
+            "filtered_metrics_csv": MetadataValue.path(str(summary["filtered_metrics_csv"])),
+            "filtered_metrics_rule_ac_csv": MetadataValue.path(
+                str(summary["filtered_metrics_rule_ac_csv"])
+            ),
+            "filtered_metrics_rule_b_csv": MetadataValue.path(
+                str(summary["filtered_metrics_rule_b_csv"])
+            ),
+            "af3_json": MetadataValue.path(str(summary["af3_json"])),
+            "af3_sequence_count": summary["af3_sequence_count"],
             "summary_path": MetadataValue.path(str(summary["summary_path"])),
             "input_rows": summary["input_rows"],
-            "passed_count": summary["passed_count"],
-            "failed_count": summary["failed_count"],
-            "predictor_suffix": summary["predictor_suffix"] or "(legacy)",
-            "fasta_count": len(fasta_files),
-            "fasta_files": MetadataValue.text("\n".join(p.name for p in fasta_files)),
+            "passed_rows": summary["passed_rows"],
+            "passed_rows_rule_ac": summary["passed_rows_rule_ac"],
+            "passed_rows_rule_b": summary["passed_rows_rule_b"],
+            "passed_sequences": summary["passed_sequences"],
+            "passed_sequences_rule_ac": summary["passed_sequences_rule_ac"],
+            "passed_sequences_rule_b": summary["passed_sequences_rule_b"],
+            "failed_sequences": summary["failed_sequences"],
+            "predictors": MetadataValue.text(",".join(summary["predictors"]) or "(none)"),
+            "rule_counts": MetadataValue.json(summary["rule_counts"]),
+            "partition_meta": MetadataValue.json(summary["partition_meta"]),
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# Glycan–binder clashes (Rule B; parallel to LH off-target)
+# ---------------------------------------------------------------------------
+
+@asset(
+    group_name="lh_offtarget_b",
+    partitions_def=design_configs,
+    deps=[filtered_designs_export],
+    description=(
+        "Align ``hCG_glycans.pdb`` onto each successful Rule B model's beta "
+        "(chain B), write superimposed PDBs under "
+        "``filtered_designs/glycan_aligned_rule_b/``, and score glycan-atom "
+        "clashes with the binder (2.4 Å). Writes "
+        "``filtered_designs/glycan_binder_clashes_rule_b.csv``."
+    ),
+)
+def glycan_binder_clashes_rule_b(context: AssetExecutionContext) -> MaterializeResult:
+    from dagster_pipeline.glycan_binder_clashes import process_rule_b_partition
+
+    pc = _read_pipeline_config(partition_key=context.partition_key)
+    proot = _partition_root(_run_outputs_dir(pc), context.partition_key, pc.run_id)
+    metrics_csv = proot / "filtered_designs" / "filtered_metrics_rule_b.csv"
+    if not metrics_csv.is_file():
+        return _empty_branch_result(
+            context,
+            reason=f"missing {metrics_csv}",
+            branch_status="no_candidates",
+        )
+    summary = process_rule_b_partition(proot)
+    context.log.info(
+        f"[glycan_binder_clashes_rule_b] partition={context.partition_key}  "
+        f"rows={summary['row_count']}  by_method={summary['by_method']}  "
+        f"csv={summary['clash_csv']}"
+    )
+    return MaterializeResult(
+        metadata={
+            "partition_key": context.partition_key,
+            "clash_csv": MetadataValue.path(summary["clash_csv"]),
+            "aligned_dir": MetadataValue.path(summary["aligned_dir"]),
+            "row_count": summary["row_count"],
+            "by_method": MetadataValue.json(summary["by_method"]),
+            "glycans_pdb": MetadataValue.path(summary["glycans_pdb"]),
+            "branch_status": _branch_status(summary["row_count"] > 0),
+        }
+    )
+
+
+@asset(
+    group_name="lh_offtarget_b",
+    partitions_def=design_configs,
+    deps=[filtered_designs_export],
+    description=(
+        "Score α-Asn52 glycan–binder clash fraction over MD-cluster GlycoSHIELD "
+        "ensembles (``/storage/hCG/glycans/gs_runs``): mean clash over accepted GS "
+        "conformers per MD cluster, then population-weighted mean across clusters. "
+        "Writes ``filtered_designs/glycan_gs_ensemble_clashes_rule_b.csv``."
+    ),
+)
+def glycan_gs_ensemble_clashes_rule_b(context: AssetExecutionContext) -> MaterializeResult:
+    from dagster_pipeline.glycan_gs_ensemble_clashes import process_rule_b_partition
+
+    pc = _read_pipeline_config(partition_key=context.partition_key)
+    proot = _partition_root(_run_outputs_dir(pc), context.partition_key, pc.run_id)
+    metrics_csv = proot / "filtered_designs" / "filtered_metrics_rule_b.csv"
+    if not metrics_csv.is_file():
+        return _empty_branch_result(
+            context,
+            reason=f"missing {metrics_csv}",
+            branch_status="no_candidates",
+        )
+    summary = process_rule_b_partition(proot)
+    context.log.info(
+        f"[glycan_gs_ensemble_clashes_rule_b] partition={context.partition_key}  "
+        f"rows={summary['row_count']}  by_method={summary['by_method']}  "
+        f"clusters={summary['n_md_clusters_available']}  csv={summary['clash_csv']}"
+    )
+    return MaterializeResult(
+        metadata={
+            "partition_key": context.partition_key,
+            "clash_csv": MetadataValue.path(summary["clash_csv"]),
+            "row_count": summary["row_count"],
+            "by_method": MetadataValue.json(summary["by_method"]),
+            "gs_runs_dir": MetadataValue.path(summary["gs_runs_dir"]),
+            "n_md_clusters_available": summary["n_md_clusters_available"],
+            "branch_status": _branch_status(summary["row_count"] > 0),
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# LH off-target group (Rule B sequences vs LH_alpha_beta.fasta)
+# ---------------------------------------------------------------------------
+
+def _lh_enabled(pc: PipelineAllToolsConfig) -> bool:
+    return bool(getattr(pc, "lh_offtarget_b", None) and pc.lh_offtarget_b.enabled)
+
+
+def _lh_target_fasta(pc: PipelineAllToolsConfig) -> str:
+    return str(pc.lh_offtarget_b.target_fasta or "").strip()
+
+
+def _lh_paths(proot: Path, dirname: str = "lh_offtarget_b") -> dict[str, Path]:
+    root = proot / dirname
+    return {
+        "root": root,
+        "seqs": root / "seqs",
+        "msa": root / "boltz2_msas",
+        "yamls": root / "combined_yamls",
+        "yaml_chunks": root / "combined_yamls_chunks",
+        "boltz2": root / "boltz2",
+        "esmfold_inputs": root / "esmfold_inputs",
+        "esmfold_chunks": root / "esmfold_input_chunks",
+        "esmfold": root / "esmfold",
+    }
+
+
+def _lh_ac_enabled(pc: PipelineAllToolsConfig) -> bool:
+    return bool(getattr(pc, "lh_offtarget_ac", None) and pc.lh_offtarget_ac.enabled)
+
+
+def _lh_ac_target_fasta(pc: PipelineAllToolsConfig) -> str:
+    return str(pc.lh_offtarget_ac.target_fasta or "").strip()
+
+
+def _lh_paths_ac(proot: Path) -> dict[str, Path]:
+    return _lh_paths(proot, "lh_offtarget_ac")
+
+
+@asset(
+    group_name="lh_offtarget_b",
+    partitions_def=design_configs,
+    deps=[filtered_designs_export],
+    output_required=False,
+    description=(
+        "Stage unique Rule B ``mpnn_seq_id`` FASTAs under ``lh_offtarget_b/seqs/`` "
+        "for LH off-target Boltz-2 / ESMFold prediction."
+    ),
+)
+def lh_rule_b_inputs(context: AssetExecutionContext):
+    pc = _read_pipeline_config(partition_key=context.partition_key)
+    proot = _partition_root(_run_outputs_dir(pc), context.partition_key, pc.run_id)
+    paths = _lh_paths(proot)
+    rule_b_csv = proot / "filtered_designs" / "filtered_metrics_rule_b.csv"
+    seqs_filtered = proot / "proteinmpnn" / "seqs_filtered"
+
+    if not _lh_enabled(pc):
+        context.log.info("[lh_rule_b_inputs] lh_offtarget_b.enabled=false — skipping")
+        yield _empty_branch_output(
+            context,
+            reason="lh_offtarget_b.enabled=false",
+            branch_status="skipped",
+            value={"sequence_count": 0},
+            sequence_count=0,
+        )
+        return
+
+    if str(_PROTEINDESIGN) not in sys.path:
+        sys.path.insert(0, str(_PROTEINDESIGN))
+    from filters.final_scores.lh_binding import stage_rule_b_fastas
+
+    staged = stage_rule_b_fastas(
+        rule_b_csv=rule_b_csv,
+        seqs_filtered_dir=seqs_filtered,
+        output_seqs_dir=paths["seqs"],
+    )
+    if not staged:
+        context.log.warning(
+            f"[lh_rule_b_inputs] partition={context.partition_key}  "
+            "no Rule B sequences; materializing empty LH branch"
+        )
+        yield _empty_branch_output(
+            context,
+            reason="no Rule B sequences in filtered_metrics_rule_b.csv",
+            value={"sequence_count": 0},
+            sequence_count=0,
+            rule_b_csv=MetadataValue.path(str(rule_b_csv)),
+            seqs_dir=MetadataValue.path(str(paths["seqs"])),
+        )
+        return
+
+    context.log.info(
+        f"[lh_rule_b_inputs] partition={context.partition_key}  "
+        f"staged={len(staged)}  dir={paths['seqs']}"
+    )
+    yield Output(
+        {
+            "partition_key": context.partition_key,
+            "seqs_dir": str(paths["seqs"]),
+            "sequence_count": len(staged),
+        },
+        metadata={
+            "seqs_dir": MetadataValue.path(str(paths["seqs"])),
+            "sequence_count": len(staged),
+            "rule_b_csv": MetadataValue.path(str(rule_b_csv)),
+            "target_fasta": MetadataValue.path(_lh_target_fasta(pc)),
+            "branch_status": "has_candidates",
+            "sample_ids": MetadataValue.text(
+                "\n".join(s.mpnn_seq_id for s in staged[:20])
+            ),
+        },
+    )
+
+
+@asset(
+    group_name="lh_offtarget_b",
+    partitions_def=design_configs,
+    deps=[lh_rule_b_inputs],
+    output_required=False,
+    description=(
+        "Precompute Boltz-2 MSAs for Rule B binders complexed with "
+        "``lh_offtarget_b.target_fasta`` (LH)."
+    ),
+)
+def lh_MSA(context: AssetExecutionContext):
+    pc = _read_pipeline_config(partition_key=context.partition_key)
+    proot = _partition_root(_run_outputs_dir(pc), context.partition_key, pc.run_id)
+    paths = _lh_paths(proot)
+    seq_dir = paths["seqs"]
+    msa_dir = paths["msa"]
+    msa_config = pc.msa
+    target_path = Path(_lh_target_fasta(pc))
+
+    if not _lh_enabled(pc):
+        yield _empty_branch_output(
+            context,
+            reason="lh_offtarget_b.enabled=false",
+            branch_status="skipped",
+            value={"complex_count": 0, "chain_count": 0},
+            complex_count=0,
+            chain_count=0,
+        )
+        return
+
+    if not target_path.is_file():
+        raise Failure(description=f"LH target FASTA not found: {target_path}")
+
+    target_raw = read_fasta_sequence_flat(target_path)
+    if not split_target_segments(target_raw):
+        raise Failure(description=f"LH target FASTA has no sequences: {target_path}")
+
+    if str(_PROTEINDESIGN) not in sys.path:
+        sys.path.insert(0, str(_PROTEINDESIGN))
+    from filters.final_scores.lh_binding import iter_lh_binder_target
+
+    exts = tuple(e if e.startswith(".") else f".{e}" for e in pc.boltz2.fasta_extensions)
+    files = (
+        sorted(p for p in seq_dir.iterdir() if p.is_file() and p.suffix.lower() in exts)
+        if seq_dir.is_dir()
+        else []
+    )
+    if not files:
+        yield _empty_branch_output(
+            context,
+            reason=f"no staged Rule B FASTAs in {seq_dir}",
+            value={"complex_count": 0, "chain_count": 0},
+            complex_count=0,
+            chain_count=0,
+        )
+        return
+
+    complexes: list[ComplexSpec] = []
+    for src in files:
+        for base, binder, target in iter_lh_binder_target(src, target_raw):
+            segments = split_target_segments(target)
+            chains = [("A", binder)]
+            chains.extend(
+                (chr(ord("B") + index), sequence)
+                for index, sequence in enumerate(segments)
+            )
+            complexes.append(ComplexSpec(name=base, chains=tuple(chains)))
+
+    if not complexes:
+        yield _empty_branch_output(
+            context,
+            reason=f"no binder records in {seq_dir}",
+            value={"complex_count": 0, "chain_count": 0},
+            complex_count=0,
+            chain_count=0,
+        )
+        return
+
+    if msa_dir.exists():
+        shutil.rmtree(msa_dir)
+    client = MsaServerClient(
+        msa_config.server_url,
+        timeout_seconds=msa_config.request_timeout_seconds,
+        max_retries=msa_config.max_retries,
+        poll_interval_seconds=msa_config.poll_interval_seconds,
+        retry_backoff_seconds=msa_config.retry_backoff_seconds,
+    )
+    paired_mode = f"pair{msa_config.pairing_strategy}"
+    if msa_config.use_env:
+        paired_mode += "-env"
+    unpaired_mode = "env" if msa_config.use_env else "all"
+
+    context.log.info(
+        f"[lh_MSA] partition={context.partition_key} complexes={len(complexes)} "
+        f"target={target_path} server={msa_config.server_url}"
+    )
+    unique_sequences = list(
+        dict.fromkeys(sequence for item in complexes for _, sequence in item.chains)
+    )
+    msa_total = len(unique_sequences) + len(complexes)
+
+    class _TqdmStdout:
+        def write(self, s: str) -> int:
+            if not s:
+                return 0
+            text = s.replace("\r", "\n").rstrip("\n")
+            if text:
+                print(text, flush=True)
+            return len(s)
+
+        def flush(self) -> None:
+            sys.stdout.flush()
+
+    with tqdm(
+        total=msa_total,
+        desc=f"LH MSA {context.partition_key}",
+        unit="msa",
+        file=_TqdmStdout(),
+        dynamic_ncols=True,
+        mininterval=0.5,
+        ascii=True,
+    ) as pbar:
+        manifest = build_boltz_msa_bundle(
+            complexes,
+            output_dir=msa_dir,
+            cache_root=Path(DEFAULT_MSA_CACHE_DIR),
+            client=client,
+            unpaired_mode=unpaired_mode,
+            paired_mode=paired_mode,
+            use_env=msa_config.use_env,
+            max_paired_seqs=msa_config.max_paired_seqs,
+            max_msa_seqs=msa_config.max_msa_seqs,
+            on_msa_done=pbar.update,
+        )
+    manifest_complexes = manifest["complexes"]
+    chain_count = sum(len(item["chains"]) for item in manifest_complexes.values())
+    yield Output(
+        {
+            "partition_key": context.partition_key,
+            "msa_dir": str(msa_dir),
+            "complex_count": len(complexes),
+            "chain_count": chain_count,
+        },
+        metadata={
+            "msa_dir": MetadataValue.path(str(msa_dir)),
+            "manifest_path": MetadataValue.path(str(msa_dir / "manifest.json")),
+            "complex_count": len(complexes),
+            "chain_count": chain_count,
+            "target_fasta": MetadataValue.path(str(target_path)),
+            "branch_status": "has_candidates",
+        },
+    )
+
+
+@asset(
+    group_name="lh_offtarget_b",
+    partitions_def=design_configs,
+    deps=[lh_MSA],
+    output_required=False,
+    description="Write Boltz-2 predict YAMLs for Rule B × LH complexes.",
+)
+def lh_boltz2_input_yamls(context: AssetExecutionContext):
+    pc = _read_pipeline_config(partition_key=context.partition_key)
+    proot = _partition_root(_run_outputs_dir(pc), context.partition_key, pc.run_id)
+    paths = _lh_paths(proot)
+    seq_dir = paths["seqs"]
+    yaml_dir = paths["yamls"]
+    msa_dir = paths["msa"]
+    bz = pc.boltz2
+    target_path = Path(_lh_target_fasta(pc))
+    template_path = Path(bz.template_yaml)
+
+    if not _lh_enabled(pc):
+        yield _empty_branch_output(
+            context,
+            reason="lh_offtarget_b.enabled=false",
+            branch_status="skipped",
+            value={"yaml_files_written": 0},
+            yaml_files_written=0,
+        )
+        return
+
+    append_seq = read_fasta_sequence_flat(target_path)
+    if not append_seq:
+        raise Failure(description=f"LH target FASTA empty: {target_path}")
+    if not template_path.is_file():
+        raise Failure(description=f"Boltz-2 template YAML not found: {template_path}")
+    template_text = template_path.read_text(encoding="utf-8")
+
+    if str(_PROTEINDESIGN) not in sys.path:
+        sys.path.insert(0, str(_PROTEINDESIGN))
+    from filters.final_scores.lh_binding import iter_lh_binder_target
+
+    exts = tuple(e if e.startswith(".") else f".{e}" for e in bz.fasta_extensions)
+    files = (
+        sorted(p for p in seq_dir.iterdir() if p.is_file() and p.suffix.lower() in exts)
+        if seq_dir.is_dir()
+        else []
+    )
+    if not files:
+        yield _empty_branch_output(
+            context,
+            reason=f"no staged FASTAs in {seq_dir}",
+            value={"yaml_files_written": 0},
+            yaml_files_written=0,
+        )
+        return
+
+    msa_manifest_path = msa_dir / "manifest.json"
+    if not msa_manifest_path.is_file():
+        raise Failure(description=f"LH MSA manifest missing: {msa_manifest_path}")
+    msa_manifest = json.loads(msa_manifest_path.read_text(encoding="utf-8"))
+    manifest_complexes = msa_manifest.get("complexes")
+    if not isinstance(manifest_complexes, dict):
+        raise Failure(description=f"Invalid LH MSA manifest: {msa_manifest_path}")
+
+    if yaml_dir.exists():
+        shutil.rmtree(yaml_dir)
+    yaml_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for src in files:
+        for base, binder, target in iter_lh_binder_target(src, append_seq):
+            complex_payload = manifest_complexes.get(base)
+            if not isinstance(complex_payload, dict) or not isinstance(
+                complex_payload.get("chains"), list
+            ):
+                raise Failure(description=f"LH MSA manifest has no complex for {base!r}.")
+            expected_chains = [("A", binder)]
+            expected_chains.extend(
+                (chr(ord("B") + index), sequence)
+                for index, sequence in enumerate(split_target_segments(target))
+            )
+            chain_payloads = complex_payload["chains"]
+            actual = [
+                (str(chain.get("id")), str(chain.get("sequence")))
+                for chain in chain_payloads
+                if isinstance(chain, dict)
+            ]
+            if actual != expected_chains:
+                raise Failure(
+                    description=(
+                        f"LH MSA chain mismatch for {base!r}: "
+                        f"expected {expected_chains}, got {actual}."
+                    )
+                )
+            msa_paths: dict[str, str] = {}
+            for chain in chain_payloads:
+                chain_id = str(chain["id"])
+                host_path = Path(str(chain["csv_path"]))
+                if not host_path.is_file():
+                    raise Failure(
+                        description=f"LH MSA CSV missing for {base}/{chain_id}: {host_path}"
+                    )
+                try:
+                    relative_path = host_path.relative_to(proot)
+                except ValueError as exc:
+                    raise Failure(
+                        description=f"LH MSA CSV outside partition root: {host_path}"
+                    ) from exc
+                msa_paths[chain_id] = f"/work/{relative_path.as_posix()}"
+            write_yaml_for_pair(
+                template_text,
+                yaml_dir,
+                base,
+                binder,
+                target,
+                msa_paths=msa_paths,
+            )
+            written += 1
+
+    yaml_files = sorted(yaml_dir.glob("*.yaml"))
+    yield Output(
+        {
+            "partition_key": context.partition_key,
+            "combined_yamls_dir": str(yaml_dir),
+            "yaml_files_written": written,
+        },
+        metadata={
+            "combined_yamls_dir": MetadataValue.path(str(yaml_dir)),
+            "yaml_files_written": written,
+            "branch_status": "has_candidates",
+            "target_fasta": MetadataValue.path(str(target_path)),
+            "sample_files": MetadataValue.text("\n".join(f.name for f in yaml_files[:10])),
+        },
+    )
+
+
+@asset(
+    group_name="lh_offtarget_b",
+    partitions_def=design_configs,
+    deps=[lh_boltz2_input_yamls],
+    description=(
+        "Boltz-2 predict for Rule B × LH into ``lh_offtarget_b/boltz2/`` "
+        "(same sampling settings as ``boltz2``; no renumber)."
+    ),
+)
+def lh_boltz2_predictions(context: AssetExecutionContext) -> MaterializeResult:
+    pc = _read_pipeline_config(partition_key=context.partition_key)
+    proot = _partition_root(_run_outputs_dir(pc), context.partition_key, pc.run_id)
+    paths = _lh_paths(proot)
+    bz = pc.boltz2
+    yaml_dir = paths["yamls"]
+    out_dir = paths["boltz2"]
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if not _lh_enabled(pc):
+        return _empty_branch_result(
+            context,
+            reason="lh_offtarget_b.enabled=false",
+            branch_status="skipped",
+            predictions_dir=MetadataValue.path(str(out_dir)),
+            input_yaml_count=0,
+            structure_file_count=0,
+        )
+
+    yaml_files = sorted(yaml_dir.glob("*.yaml")) if yaml_dir.is_dir() else []
+    if not yaml_files:
+        return _empty_branch_result(
+            context,
+            reason=f"no LH Boltz YAMLs in {yaml_dir}",
+            predictions_dir=MetadataValue.path(str(out_dir)),
+            input_yaml_count=0,
+            structure_file_count=0,
+        )
+
+    chunk_size = bz.query_chunk_size if bz.query_chunk_size > 0 else len(yaml_files)
+    chunk_root = paths["yaml_chunks"]
+    if chunk_root.exists():
+        shutil.rmtree(chunk_root)
+    chunk_root.mkdir(parents=True, exist_ok=True)
+
+    chunk_count = 0
+    for i in range(0, len(yaml_files), chunk_size):
+        chunk_count += 1
+        chunk_files = yaml_files[i : i + chunk_size]
+        chunk_dir = chunk_root / f"chunk_{chunk_count:04d}"
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+        for src in chunk_files:
+            dst = chunk_dir / src.name
+            if dst.exists():
+                dst.unlink()
+            os.symlink(os.path.relpath(src, start=chunk_dir), dst)
+
+        boltz_devices = max(1, bz.devices)
+        boltz_gpus = _select_gpu_ids(pc.gpus, boltz_devices)
+        cmd = [
+            "docker", "run", "--rm", *_docker_user_args(),
+            "--runtime=nvidia",
+            "--ipc=host",
+            *_docker_gpu_args(boltz_gpus),
+            "-e",
+            "LD_LIBRARY_PATH=/usr/local/lib/python3.11/dist-packages/nvidia/cu13/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64",
+            "-v", f"{proot}:/work:rw",
+            "-v", f"{DEFAULT_BOLTZ2_CACHE_VOLUME}:/cache:rw",
+            bz.docker_image,
+            "predict",
+            f"/work/lh_offtarget_b/combined_yamls_chunks/chunk_{chunk_count:04d}",
+            "--cache", "/cache",
+            "--out_dir", "/work/lh_offtarget_b/boltz2",
+            "--recycling_steps", str(bz.recycling_steps),
+            "--devices", str(boltz_devices),
+            "--diffusion_samples", str(bz.diffusion_samples),
+            "--num_workers", str(bz.num_workers),
+            "--preprocessing-threads", str(bz.preprocessing_threads),
+        ]
+        if bz.use_potentials:
+            cmd.append("--use_potentials")
+        cmd.extend(["--override", "--no_kernels"])
+        _run(context, cmd)
+
+    structure_files = list(out_dir.rglob("*.cif")) or list(out_dir.rglob("*.pdb"))
+    if not structure_files:
+        raise RuntimeError(
+            f"LH Boltz-2 completed without structures in {out_dir}. Check Boltz-2 logs."
+        )
+    return MaterializeResult(
+        metadata={
+            "predictions_dir": MetadataValue.path(str(out_dir)),
+            "input_yaml_count": len(yaml_files),
+            "chunk_count": chunk_count,
+            "structure_file_count": len(structure_files),
+            "diffusion_samples": bz.diffusion_samples,
+            "target_fasta": MetadataValue.path(_lh_target_fasta(pc)),
+        }
+    )
+
+
+@asset(
+    group_name="lh_offtarget_b",
+    partitions_def=design_configs,
+    deps=[lh_rule_b_inputs],
+    output_required=False,
+    description="ESMFold2 JSON inputs for Rule B binders × LH target.",
+)
+def lh_esmfold_input_jsons(context: AssetExecutionContext):
+    pc = _read_pipeline_config(partition_key=context.partition_key)
+    proot = _partition_root(_run_outputs_dir(pc), context.partition_key, pc.run_id)
+    paths = _lh_paths(proot)
+    seq_dir = paths["seqs"]
+    json_dir = paths["esmfold_inputs"]
+    target_path = Path(_lh_target_fasta(pc))
+
+    if not _lh_enabled(pc):
+        yield _empty_branch_output(
+            context,
+            reason="lh_offtarget_b.enabled=false",
+            branch_status="skipped",
+            value={"files_written": 0},
+            files_written=0,
+        )
+        return
+
+    append_seq = read_fasta_sequence_flat(target_path)
+    if not append_seq:
+        raise Failure(description=f"LH target FASTA empty: {target_path}")
+
+    if str(_PROTEINDESIGN) not in sys.path:
+        sys.path.insert(0, str(_PROTEINDESIGN))
+    from filters.final_scores.lh_binding import iter_lh_binder_target
+
+    exts = tuple(e if e.startswith(".") else f".{e}" for e in pc.boltz2.fasta_extensions)
+    files = (
+        sorted(p for p in seq_dir.iterdir() if p.is_file() and p.suffix.lower() in exts)
+        if seq_dir.is_dir()
+        else []
+    )
+    if not files:
+        yield _empty_branch_output(
+            context,
+            reason=f"no staged FASTAs in {seq_dir}",
+            value={"files_written": 0},
+            files_written=0,
+        )
+        return
+
+    if json_dir.exists():
+        shutil.rmtree(json_dir)
+    json_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for src in files:
+        for base, binder, target in iter_lh_binder_target(src, append_seq):
+            write_json_for_pair(json_dir, base, binder, target)
+            written += 1
+
+    yield Output(
+        {
+            "partition_key": context.partition_key,
+            "esmfold_inputs_dir": str(json_dir),
+            "files_written": written,
+        },
+        metadata={
+            "esmfold_inputs_dir": MetadataValue.path(str(json_dir)),
+            "files_written": written,
+            "branch_status": "has_candidates",
+            "target_fasta": MetadataValue.path(str(target_path)),
+        },
+    )
+
+
+@asset(
+    group_name="lh_offtarget_b",
+    partitions_def=design_configs,
+    deps=[lh_esmfold_input_jsons],
+    description=(
+        "ESMFold2 predict for Rule B × LH into ``lh_offtarget_b/esmfold/`` "
+        "(same sampling settings as ``esmfold``; no renumber)."
+    ),
+)
+def lh_esmfold_predictions(context: AssetExecutionContext) -> MaterializeResult:
+    pc = _read_pipeline_config(partition_key=context.partition_key)
+    proot = _partition_root(_run_outputs_dir(pc), context.partition_key, pc.run_id)
+    paths = _lh_paths(proot)
+    ef = pc.esmfold
+    json_dir = paths["esmfold_inputs"]
+    out_dir = paths["esmfold"]
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if not _lh_enabled(pc):
+        return _empty_branch_result(
+            context,
+            reason="lh_offtarget_b.enabled=false",
+            branch_status="skipped",
+            predictions_dir=MetadataValue.path(str(out_dir)),
+            input_json_count=0,
+            cif_file_count=0,
+        )
+
+    query_files = sorted(json_dir.glob("*.json")) if json_dir.is_dir() else []
+    if not query_files:
+        return _empty_branch_result(
+            context,
+            reason=f"no LH ESMFold JSONs in {json_dir}",
+            predictions_dir=MetadataValue.path(str(out_dir)),
+            input_json_count=0,
+            cif_file_count=0,
+        )
+
+    chunk_size = ef.query_chunk_size if ef.query_chunk_size > 0 else len(query_files)
+    chunk_root = paths["esmfold_chunks"]
+    if chunk_root.exists():
+        shutil.rmtree(chunk_root)
+    chunk_root.mkdir(parents=True, exist_ok=True)
+
+    proot_str = str(proot.resolve())
+    predict_script = _esmfold_predict_script()
+    esmfold2_dir_str = str(predict_script.parent)
+    hf_cache = _esmfold_hf_cache_dir()
+    hf_cache.mkdir(parents=True, exist_ok=True)
+    hf_cache_str = str(hf_cache)
+
+    chunk_count = 0
+    for i in range(0, len(query_files), chunk_size):
+        chunk_count += 1
+        chunk_files = query_files[i : i + chunk_size]
+        chunk_dir = chunk_root / f"chunk_{chunk_count:04d}"
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+        for src in chunk_files:
+            dst = chunk_dir / src.name
+            if dst.exists():
+                dst.unlink()
+            os.symlink(os.path.relpath(src, start=chunk_dir), dst)
+
+        esmfold_gpus = _select_gpu_ids(pc.gpus, 1)
+        chunk_input = f"{proot_str}/lh_offtarget_b/esmfold_input_chunks/chunk_{chunk_count:04d}"
+        cmd: List[str] = [
+            "docker", "run", "--rm", *_docker_user_args(),
+            "--runtime=nvidia",
+            *_docker_gpu_args(esmfold_gpus),
+            "-v", f"{proot_str}:{proot_str}:rw",
+            "-v", f"{esmfold2_dir_str}:{esmfold2_dir_str}:ro",
+            "-v", f"{hf_cache_str}:/cache/huggingface",
+            "-e", "HF_HOME=/cache/huggingface",
+            "-e", "TRANSFORMERS_CACHE=/cache/huggingface",
+            "-e", "HUGGINGFACE_HUB_CACHE=/cache/huggingface",
+            ef.docker_image,
+            "python", str(predict_script),
+            "-i", chunk_input,
+            "-o", f"{proot_str}/lh_offtarget_b/esmfold",
+            "--model", ef.model,
+            "--num-loops", str(ef.num_loops),
+            "--num-sampling-steps", str(ef.num_sampling_steps),
+            "--num-diffusion-samples", str(ef.num_diffusion_samples),
+            "--seed", str(ef.seed),
+            "--device", "cuda",
+        ]
+        _run(context, cmd)
+
+    cif_files = list(out_dir.glob("*.cif")) + list(out_dir.rglob("*_model_*.cif"))
+    # de-dupe
+    cif_files = sorted({p.resolve() for p in cif_files})
+    if not cif_files:
+        raise RuntimeError(
+            f"LH ESMFold completed without CIF files in {out_dir}. Check ESMFold logs."
+        )
+    return MaterializeResult(
+        metadata={
+            "predictions_dir": MetadataValue.path(str(out_dir)),
+            "input_json_count": len(query_files),
+            "chunk_count": chunk_count,
+            "cif_file_count": len(cif_files),
+            "num_diffusion_samples": ef.num_diffusion_samples,
+            "target_fasta": MetadataValue.path(_lh_target_fasta(pc)),
+        }
+    )
+
+
+@asset(
+    group_name="lh_offtarget_b",
+    partitions_def=design_configs,
+    deps=[lh_boltz2_predictions, lh_esmfold_predictions],
+    description=(
+        "Score LH Boltz-2 / ESMFold predictions with specificity_hotspots (B68/B77) "
+        "inside the ``final_scores`` Docker image and write "
+        "``filtered_designs/LH_binding.csv``."
+    ),
+)
+def lh_binding_scores(context: AssetExecutionContext) -> MaterializeResult:
+    pc = _read_pipeline_config(partition_key=context.partition_key)
+    proot = _partition_root(_run_outputs_dir(pc), context.partition_key, pc.run_id)
+    out_csv = proot / "filtered_designs" / "LH_binding.csv"
+    fs = pc.final_scores
+
+    if not _lh_enabled(pc):
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        out_csv.write_text(
+            "mpnn_seq_id,model_index,binder_seq,specificity_hotspots_boltz,"
+            "specificity_hotspots_esmfold,binder_aas_contact_B77_boltz,"
+            "binder_aas_contact_B77_esmfold,structure_pdb_boltz,structure_pdb_esmfold\n",
+            encoding="utf-8",
+        )
+        return _empty_branch_result(
+            context,
+            reason="lh_offtarget_b.enabled=false",
+            branch_status="skipped",
+            lh_binding_csv=MetadataValue.path(str(out_csv)),
+            row_count=0,
+        )
+
+    # Score inside final_scores Docker (numpy / Biopython / scipy). Host Dagster
+    # envs often lack these packages — do not import residue_contacts on the host.
+    final_scores_dir = _PROTEINDESIGN / "filters" / "final_scores"
+    script = final_scores_dir / "run_lh_binding.py"
+    if not script.is_file():
+        raise Failure(description=f"LH binding scorer missing: {script}")
+
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    cmd: List[str] = [
+        "docker",
+        "run",
+        "--rm",
+        *_docker_user_args(),
+        "-v",
+        f"{final_scores_dir.resolve()}:{final_scores_dir.resolve()}",
+        "-v",
+        f"{proot.resolve()}:{proot.resolve()}",
+        fs.docker_image,
+        "python",
+        str(script.resolve()),
+        str(proot.resolve()),
+        "--output-csv",
+        str(out_csv.resolve()),
+    ]
+    _run(context, cmd)
+
+    if not out_csv.is_file():
+        raise Failure(description=f"LH_binding.csv was not written: {out_csv}")
+
+    # Lightweight host-side summary (stdlib only) for Dagster metadata.
+    rows = list(csv.DictReader(out_csv.open(newline="", encoding="utf-8")))
+    rule_b_csv = proot / "filtered_designs" / "filtered_metrics_rule_b.csv"
+    rule_b_ids: set[str] = set()
+    if rule_b_csv.is_file():
+        with rule_b_csv.open(newline="", encoding="utf-8") as fh:
+            rule_b_ids = {
+                str(r.get("mpnn_seq_id") or "").strip()
+                for r in csv.DictReader(fh)
+                if str(r.get("mpnn_seq_id") or "").strip()
+            }
+    context.log.info(
+        f"[lh_binding_scores] partition={context.partition_key}  "
+        f"rows={len(rows)}  csv={out_csv}  docker_image={fs.docker_image}"
+    )
+    return MaterializeResult(
+        metadata={
+            "lh_binding_csv": MetadataValue.path(str(out_csv)),
+            "row_count": len(rows),
+            "rule_b_sequence_count": len(rule_b_ids),
+            "boltz_model_count": sum(1 for r in rows if r.get("structure_pdb_boltz")),
+            "esmfold_model_count": sum(1 for r in rows if r.get("structure_pdb_esmfold")),
+            "docker_image": fs.docker_image,
+            "target_fasta": MetadataValue.path(_lh_target_fasta(pc)),
+        }
+    )
+
+
+@asset(
+    group_name="lh_offtarget_b",
+    partitions_def=design_configs,
+    deps=[lh_binding_scores, glycan_gs_ensemble_clashes_rule_b, glycan_binder_clashes_rule_b],
+    description=(
+        "Build a run-level Rule B Marp presentation (``deck_rule_b.md`` + "
+        "``deck_rule_b.pdf`` + ``deck_rule_b.pptx``) after LH specificity scoring "
+        "and MD/GlycoSHIELD ensemble glycan–binder clash scoring. "
+        "Writes ``{run_id}/rule_b/`` using every partition under the run that has "
+        "``filtered_metrics_rule_b.csv``."
+    ),
+)
+def rule_b_presentation(context: AssetExecutionContext) -> MaterializeResult:
+    pc = _read_pipeline_config(partition_key=context.partition_key)
+    run_dir = Path(_run_outputs_dir(pc))
+    cfg = pc.rule_b_presentation
+    out_dir = run_dir / "rule_b"
+
+    if not cfg.enabled:
+        return _empty_branch_result(
+            context,
+            reason="rule_b_presentation.enabled=false",
+            branch_status="skipped",
+            output_dir=MetadataValue.path(str(out_dir)),
+        )
+
+    run_dirs = [
+        child
+        for child in sorted(run_dir.iterdir())
+        if child.is_dir()
+        and (child / "filtered_designs" / "filtered_metrics_rule_b.csv").is_file()
+    ]
+    if not run_dirs:
+        return _empty_branch_result(
+            context,
+            reason=f"no filtered_metrics_rule_b.csv under {run_dir}",
+            branch_status="no_candidates",
+            output_dir=MetadataValue.path(str(out_dir)),
+        )
+
+    from dagster_pipeline.rule_b_presentation import build_rule_b_presentation
+
+    context.log.info(
+        f"[rule_b_presentation] partition={context.partition_key}  "
+        f"run_dirs={len(run_dirs)}  out={out_dir}  "
+        f"pymol={cfg.pymol}  marp_image={cfg.marp_docker_image}"
+    )
+    summary = build_rule_b_presentation(
+        run_dirs,
+        out_dir,
+        seed=cfg.seed,
+        pymol=Path(cfg.pymol),
+        scaffolds_dir=Path(cfg.scaffolds_dir),
+        marp_docker_image=cfg.marp_docker_image,
+        export_pdf=cfg.export_pdf,
+        export_pptx=getattr(cfg, "export_pptx", True),
+        export_html=False,
+    )
+    context.log.info(
+        f"[rule_b_presentation] slides={summary['slide_count']}  "
+        f"md={summary['deck_md']}  pdf={summary.get('deck_pdf')}  "
+        f"pptx={summary.get('deck_pptx')}"
+    )
+    meta: dict[str, Any] = {
+        "output_dir": MetadataValue.path(str(out_dir)),
+        "slide_count": summary["slide_count"],
+        "partition_count": len(run_dirs),
+        "deck_md": MetadataValue.path(str(summary["deck_md"])),
+        "assets_dir": MetadataValue.path(str(summary["assets_dir"])),
+        "export_pdf": cfg.export_pdf,
+        "export_pptx": getattr(cfg, "export_pptx", True),
+        "marp_docker_image": cfg.marp_docker_image,
+    }
+    if summary.get("deck_pdf"):
+        meta["deck_pdf"] = MetadataValue.path(str(summary["deck_pdf"]))
+    if summary.get("deck_pptx"):
+        meta["deck_pptx"] = MetadataValue.path(str(summary["deck_pptx"]))
+    if summary["slide_count"] == 0:
+        meta["branch_status"] = "no_candidates"
+        meta["skip_reason"] = "no Rule B sequences with ≥1 successful Boltz and ESMFold"
+    return MaterializeResult(metadata=meta)
+
+
+@asset(
+    group_name="lh_offtarget_b",
+    partitions_def=design_configs,
+    deps=[rule_b_presentation],
+    description=(
+        "Zip every Rule B design that appears in the Marp deck (≥1 successful "
+        "Boltz and ESMFold on hCG). Writes ``{run_id}/rule_b/successful_designs.zip`` "
+        "with per-sequence FASTA, hCG metrics CSV, and one superimposed PDB per "
+        "Boltz / ESMFold model (prediction A/B/C + ``hCG_glycans.pdb`` as X/Y)."
+    ),
+)
+def rule_b_successful_designs_zip(context: AssetExecutionContext) -> MaterializeResult:
+    from dagster_pipeline.successful_designs_export import build_rule_b_successful_zip
+
+    pc = _read_pipeline_config(partition_key=context.partition_key)
+    run_dir = Path(_run_outputs_dir(pc))
+    out_zip = run_dir / "rule_b" / "successful_designs.zip"
+
+    run_dirs = [
+        child
+        for child in sorted(run_dir.iterdir())
+        if child.is_dir()
+        and (child / "filtered_designs" / "filtered_metrics_rule_b.csv").is_file()
+    ]
+    if not run_dirs:
+        return _empty_branch_result(
+            context,
+            reason=f"no filtered_metrics_rule_b.csv under {run_dir}",
+            branch_status="no_candidates",
+            zip_path=MetadataValue.path(str(out_zip)),
+        )
+
+    summary = build_rule_b_successful_zip(run_dirs, out_zip)
+    context.log.info(
+        f"[rule_b_successful_designs_zip] sequences={summary['sequence_count']}  "
+        f"partitions={summary['partition_count']}  zip={summary['zip_path'] or out_zip}  "
+        f"glycans={summary.get('glycans_pdb')}"
+    )
+    if summary["sequence_count"] == 0:
+        return _empty_branch_result(
+            context,
+            reason="no Rule B presentation sequences (≥1 successful Boltz and ESMFold)",
+            branch_status="no_candidates",
+            zip_path=MetadataValue.path(str(out_zip)),
+            sequence_count=0,
+            partition_count=0,
+        )
+    return MaterializeResult(
+        metadata={
+            "zip_path": MetadataValue.path(summary["zip_path"]),
+            "sequence_count": summary["sequence_count"],
+            "partition_count": summary["partition_count"],
+            "glycans_pdb": MetadataValue.path(summary["glycans_pdb"]),
+            "track": "rule_b",
         }
     )
 
@@ -3130,7 +4461,8 @@ def filtered_designs_export(context: AssetExecutionContext) -> MaterializeResult
     output_required=False,
     description=(
         "Builds ColabFold input FASTAs when SoluProt filtering left sequences in "
-        "``seqs_filtered/``. Skipped when no sequences passed."
+        "``seqs_filtered/``. When no sequences passed, materializes "
+        "``branch_status=no_candidates``."
     ),
 )
 def colabfold_input_fastas(context: AssetExecutionContext):
@@ -3149,17 +4481,31 @@ def colabfold_input_fastas(context: AssetExecutionContext):
 
     exts = tuple(e if e.startswith(".") else f".{e}" for e in bz.fasta_extensions)
     if not seq_dir.is_dir():
-        raise Failure(
-            description=(
-                f"SoluProt filtered sequence directory missing for partition "
-                f"{context.partition_key!r}: {seq_dir}."
-            )
+        context.log.warning(
+            f"[colabfold_input_fastas] partition={context.partition_key}  "
+            f"missing {seq_dir}; materializing empty ColabFold input branch"
         )
+        yield _empty_branch_output(
+            context,
+            reason=f"SoluProt filtered sequence directory missing: {seq_dir}",
+            value={"source_fasta_count": 0, "files_written": 0},
+            source_fastas=0,
+            files_written=0,
+        )
+        return
     files = sorted(p for p in seq_dir.iterdir() if p.is_file() and p.suffix.lower() in exts)
     if not files:
         context.log.warning(
             f"[colabfold_input_fastas] partition={context.partition_key}  "
-            f"no FASTAs in {seq_dir}; skipping ColabFold branch"
+            f"no FASTAs in {seq_dir}; materializing empty ColabFold input branch"
+        )
+        yield _empty_branch_output(
+            context,
+            reason=f"no FASTAs in {seq_dir}",
+            value={"source_fasta_count": 0, "files_written": 0},
+            source_fastas=0,
+            files_written=0,
+            seq_dir=MetadataValue.path(str(seq_dir)),
         )
         return
 
@@ -3207,14 +4553,18 @@ def colabfold_predictions(
     out_dir = proot / "colabfold"
     out_dir.mkdir(parents=True, exist_ok=True)
     combined_dir = proot / "proteinmpnn" / "combined_seqs"
-    query_files = sorted(p for p in combined_dir.iterdir() if p.is_file())
+    query_files = sorted(p for p in combined_dir.iterdir() if p.is_file()) if combined_dir.is_dir() else []
     if not query_files:
-        raise Failure(
-            description=(
-                f"ColabFold query directory missing or empty for partition "
-                f"{context.partition_key!r}: {combined_dir}. colabfold_input_fastas "
-                "may not have materialized."
-            )
+        context.log.warning(
+            f"[colabfold_predictions] partition={context.partition_key}  "
+            f"no queries in {combined_dir}; materializing empty ColabFold predictions"
+        )
+        return _empty_branch_result(
+            context,
+            reason=f"ColabFold query directory missing or empty: {combined_dir}",
+            predictions_dir=MetadataValue.path(str(out_dir)),
+            query_count=0,
+            pdb_file_count=0,
         )
 
     patch = _colabfold_alphafold_patch_prefix() if cf.apply_alphafold_numpy_patch else ""
@@ -3314,10 +4664,29 @@ all_assets = [
     MSA,
     boltz2_input_yamls,
     boltz2_predictions,
+    boltz2_renumber,
     esmfold_input_jsons,
     esmfold_predictions,
+    esmfold_renumber,
     final_scores_metrics,
     filtered_designs_export,
+    glycan_binder_clashes_rule_b,
+    glycan_gs_ensemble_clashes_rule_b,
+    lh_rule_b_inputs,
+    lh_MSA,
+    lh_boltz2_input_yamls,
+    lh_boltz2_predictions,
+    lh_esmfold_input_jsons,
+    lh_esmfold_predictions,
+    lh_binding_scores,
+    rule_b_presentation,
+    rule_b_successful_designs_zip,
     # colabfold_input_fastas,
     # colabfold_predictions,
 ]
+
+# Imported only after every shared helper and base asset above is defined.
+# rule_ac_track deliberately does not import this module at import time.
+from dagster_pipeline.rule_ac_track import RULE_AC_ASSETS  # noqa: E402
+
+all_assets.extend(RULE_AC_ASSETS)
