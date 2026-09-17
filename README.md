@@ -4,6 +4,8 @@ Asset graph for **design → structure filter → ProteinMPNN → SoluProt → M
 
 Runtime config is written per run to `{outputs_root}/{run_id}/pipeline_config.yaml`. The file in this directory is only the **Launchpad template**.
 
+![Global asset lineage](Global_Asset_Lineage_1.svg)
+
 ## Jobs
 
 | Job | What it does |
