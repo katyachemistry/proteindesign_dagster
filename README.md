@@ -1,5 +1,21 @@
 # Protein design Dagster pipeline
 
+Asset graph for **design → structure filter → ProteinMPNN → SoluProt → MSA → Boltz-2 / ESMFold → scores → Rule A/B/C follow-up**.
+
+Runtime config is written per run to `{outputs_root}/{run_id}/pipeline_config.yaml`. The file in this directory is only the **Launchpad template**.
+
+## Jobs
+
+| Job | What it does |
+|---|---|
+| `generate_configs` | Persist tool params, generate YAMLs for enabled design tools, register partitions. Run this first for a design campaign. |
+| `design_pipeline` | Design backends → structure filter → ProteinMPNN → SoluProt → shared MSA → Boltz-2 + ESMFold (and renumber). Select partition(s) in Launchpad. |
+| `register_sequences` | Add external-sequence partitions under a run (`{run_id}__seq__{fasta_stem}`). Template: [`register_sequences_config.yaml`](register_sequences_config.yaml). |
+| `sequence_pipeline` | Import FASTAs → SoluProt → MSA → Boltz-2 + ESMFold for `sequence_import` partitions. Run `register_sequences` first. |
+| `final_scores` | Developability metrics, Rule A/B/C export, glycan clashes, LH off-target, Marp decks, presentation zips. Materialize after predictions (at least one of Boltz-2 / ESMFold). |
+
+ColabFold assets exist in code but are **not** registered in `design_pipeline`.
+
 ## Install
 
 ```bash
@@ -8,216 +24,298 @@ mamba activate proteindesign-dagster
 pip install -e /storage/proteindesign/dagster_pipeline
 ```
 
-## Docker images
+## Start UI (SSH tunnel)
 
-The pipeline runs tools via `docker run`. Image names come from
-[`pipeline_config.yaml`](pipeline_config.yaml) (written by the `pipeline_config`
-asset). GPU steps need the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
-(`--runtime=nvidia`).
+**On the server:**
 
-| Image | Used by | Default in config |
-|---|---|---|
-| `rfdiffusion` | `rfdiffusion_generation` | `rfdiffusion.docker_image` |
-| `boltzgen` | `boltzgen_generation` | `boltzgen.docker_image` |
-| `rosettacommons/proteinmpnn` | `proteinmpnn_*` | `proteinmpnn.docker_image` |
-| `boltz2` | `boltz2_predictions` | `boltz2.docker_image` |
-| `esmfold2` | `esmfold_predictions` | `esmfold.docker_image` |
-| `structure_tools` | `design_structure_filter`, `boltz2_renumber`, `esmfold_renumber` | `structure_filters.structure_docker_image` |
-| `aggregation_filters` | NetSolP, protein-sol, Aggrescan3D; Dagster RMSD reuses image for Python only | `filters.docker_image` (RMSD script: host `filters.scripts_host_dir`, not in image) |
-| `soluprot` | SoluProt sequence solubility (USEARCH + TMHMM) | `soluprot.docker_image` (filter after ProteinMPNN) |
-| `alpine` | internal `chown` / `chmod` after container writes | hard-coded in `assets.py` |
+```bash
+mamba activate proteindesign-dagster
+cd /storage/proteindesign/dagster_pipeline
+dagster dev -h 0.0.0.0 -p 3000 -m dagster_pipeline.definitions
+```
 
-#### SoluProt filter (`proteinmpnn_soluprot_filter`)
+**On your laptop:**
 
-After `proteinmpnn_sequences`, the pipeline runs SoluProt on all binder sequences
-(one combined FASTA per partition), then writes passing sequences to
-``proteinmpnn/seqs_filtered/``. Boltz-2 and ESMFold read from that directory.
+```bash
+ssh -L 3000:127.0.0.1:3000 USER@SERVER
+```
 
-Configure in ``pipeline_config.yaml`` under ``soluprot``:
+Then open **http://127.0.0.1:3000**.
 
-| Key | Default | Meaning |
-|-----|---------|---------|
-| `enabled` | `true` | Set `false` to passthrough ``seqs/`` unchanged |
-| `min_soluble_score` | `0.5` | Keep sequences with SoluProt probability ≥ this |
-| `no_tmhmm` | `false` | Use full TMHMM model (recommended with `soluprot` image) |
-| `no_proc` | `1` | Parallel SoluProt workers |
-| `fail_if_all_filtered` | `false` | Legacy flag; Dagster always records an empty SoluProt result. Downstream Boltz-2 / ESMFold assets materialize as ``no_candidates`` instead of failing the partition |
+## Running the pipeline
 
-Build the image: [`filters/soluprot/build.sh`](../filters/soluprot/build.sh).
+1. Edit [`pipeline_config.yaml`](pipeline_config.yaml) (enable tools, designs, GPUs, etc.).
+2. Launchpad → **`generate_configs`** → Launch (empty `run_id` creates a timestamped folder under `outputs_root`).
+3. Launchpad → **`design_pipeline`** → select partition(s) → Launch.
+4. After Boltz-2 and/or ESMFold finish: Launchpad → **`final_scores`** → same partition(s).
 
-**Empty filter results:** When the design structure filter or SoluProt step leaves
-no candidates, every downstream asset in the selection still **materializes** with
-``has_candidates=false`` / ``branch_status=no_candidates`` (or ``skipped`` for
-wrong-tool / ``sequence_import`` partitions). Expensive work (ProteinMPNN Docker,
-MSA, Boltz-2, ESMFold) does not run, but asset backfills complete instead of
-hanging forever on Dagster ``STEP_SKIPPED`` partitions that never emit a
-materialization.
+**Partial re-run** (e.g. changed ProteinMPNN params): Asset Catalog → select `proteinmpnn_sequences` and everything downstream → **Materialize selected**. Downstream assets read the **run-scoped** `{outputs_root}/{run_id}/pipeline_config.yaml`, not the repo template.
 
-Status metadata to look for in the UI:
+**External sequences:** Launchpad → `register_sequences` (set `add_to_run_id` + `input_path`) → `sequence_pipeline` on the new `{run_id}__seq__*` keys → then `final_scores` if needed.
 
-| ``branch_status`` | Meaning |
+### Partitions
+
+Design partitions are tool-tagged:
+
+```text
+{run_id}__{rfdiffusion|boltzgen|promera}__{design_name}__{target}__{hotspot_or_spec}__{yaml_stem}
+```
+
+Imported sequences:
+
+```text
+{run_id}__seq__{fasta_stem}
+```
+
+Run layout (default `outputs_root`: `/storage/hCG/designs/runs`):
+
+```text
+{outputs_root}/{run_id}/
+  pipeline_config.yaml
+  design_configs_manifest.json
+  design_configs/{rfdiffusion|boltzgen|promera}/...
+  {partition_suffix}/
+    designs/{tool}/design_*.pdb    # BoltzGen also keeps raw/*.cif
+    pdbs_filtered/                 # after design_structure_filter → ProteinMPNN
+    proteinmpnn/
+    boltz2/  boltz2_renumbered/
+    esmfold/ esmfold_renumbered/
+    final_scores/metrics.csv
+    filtered_designs/
+    lh_offtarget_b/                # Rule B LH
+    lh_offtarget_ac/               # Rule A/C LH
+  rule_b/                          # Marp deck for Rule B (run-level)
+  rule_ac/                         # Marp deck for Rule A/C (run-level)
+```
+
+### Empty filters
+
+When the design structure filter or SoluProt leaves no candidates, downstream assets still **materialize** with `has_candidates=false` / `branch_status=no_candidates` (or `skipped` for the wrong tool / `sequence_import`). Expensive work does not run, but backfills complete instead of hanging on Dagster `STEP_SKIPPED`.
+
+| `branch_status` | Meaning |
 |---|---|
 | `has_candidates` | Normal work ran |
 | `no_candidates` | Filter left nothing; empty success |
 | `skipped` | Asset does not apply to this partition type |
 
-### Design backends (RFdiffusion / BoltzGen)
+## Launchpad config (what you change often)
 
-Enable either or both under ``pipeline_config.yaml``:
+Top-level keys live on the `pipeline_config` asset (`generate_configs`). Defaults below match the repo template.
 
-| Key | Meaning |
-|-----|---------|
-| `rfdiffusion.enabled` | Generate RFdiffusion partitions (`tool=rfdiffusion`) |
-| `boltzgen.enabled` | Generate BoltzGen design-only partitions (`tool=boltzgen`) |
+| Scope | Fields | Notes |
+|---|---|---|
+| Top level | `gpus`, `run_id`, `outputs_root` | `gpus` is shared (e.g. `1,2`). Empty `run_id` → timestamped run dir. |
+| `rfdiffusion` | `enabled`, `designs_config`, `extra_hydra_args` | Per-design hotspots, target PDB, scaffold list, inline or file template YAML. |
+| `boltzgen` | `enabled`, `num_designs`, `designs_config` | Per-scaffold `binder_sequence_file`, hotspots, antihotspots. |
+| `promera` | `enabled`, `designs_config` | `task_config_yaml` template + `target_fasta` / `target_pdb` / `hotspots_txts_dir`. Optional `hotspot_files` subset (`[]` = all `.txt`). |
+| `structure_filters` | `enabled`, `structure_docker_image` | `enabled` only gates `design_structure_filter`. Renumber still uses the image when `*_renumber_outputs` is true. |
+| `proteinmpnn` | `num_seq_per_target`, `sampling_temp`, `omit_AAs`, `omit_AA`, `use_soluble_model` | Per-scaffold `omit_AA` (e.g. `affimer: C`) merged when the name matches. BoltzGen can pass `--fixed_positions_jsonl`. |
+| `soluprot` | `enabled`, `min_soluble_score`, `no_proc` | After MPNN; passing seqs go to `proteinmpnn/seqs_filtered/`. |
+| `msa` | `server_url`, pairing / retry settings | Required for Boltz-2 (and LH Boltz-2). ESMFold is MSA-free. |
+| `boltz2` | `target_fasta`, `target_pdb`, `diffusion_samples`, `renumber_outputs` | Target FASTA segments split on `:` become chains B, C, … |
+| `esmfold` | `num_loops`, `num_diffusion_samples`, `renumber_outputs` | Target FASTA shared with Boltz-2. |
+| `final_scores` | `cpus`, `ipsae_script`, `skip_ipsae` | Hotspots/antihotspots usually come from the design YAML; sequence-import writes them via `register_sequences`. |
+| `filtered_designs` | Rule A/B/C thresholds | See [Final scores](#final-scores-and-rules-abc). |
+| `lh_offtarget_b` / `lh_offtarget_ac` | `enabled`, `target_fasta` | LH alpha:beta FASTA instead of hCG. |
+| `rule_b_presentation` / `rule_ac_presentation` | `pymol`, `marp_docker_image`, `export_pdf` / `export_pptx` | Host PyMOL + Marp CLI image. |
 
-Partition keys are tool-tagged:
+## Design backends
 
-```text
-{run_id}__{rfdiffusion|boltzgen}__{design_name}__{target}__{hotspot_or_spec}__{yaml_stem}
-```
+Enable any combination:
 
-Run layout (default ``outputs_root``: ``/storage/hCG/designs/runs``):
+| Key | Partitions | Output |
+|---|---|---|
+| `rfdiffusion.enabled` | `tool=rfdiffusion` | Scaffold-guided backbones |
+| `boltzgen.enabled` | `tool=boltzgen` | Design-only (`boltzgen run … --steps design`); pipeline ProteinMPNN replaces inverse folding |
+| `promera.enabled` | `tool=promera` | `python -m promera` Design task; PDBs normalized to `designs/promera/design_N.pdb` (A=binder, B=target) |
 
-```text
-{outputs_root}/{run_id}/
-  design_configs/rfdiffusion/...
-  design_configs/boltzgen/...
-  {partition_suffix}/
-    designs/{tool}/design_*.pdb   # BoltzGen also keeps raw/*.cif
-    pdbs_filtered/                # after design_structure_filter → ProteinMPNN
-```
+Shared **`design_structure_filter`**: optional binder–target CA contacts (`antihotspots.enabled` + `structure_filters.enabled`), then 100% hotspot coverage and a capped antihotspot contact fraction. Passing PDBs go to `pdbs_filtered/` for ProteinMPNN. Binder–alpha contacts are reported only.
 
-BoltzGen runs ``boltzgen run … --steps design`` only (pipeline ProteinMPNN replaces
-inverse folding). Set ``HF_TOKEN`` in the environment or repo ``.env`` for HuggingFace
-weight downloads. The asset also sets ``--shm-size``, ``--group-add`` (gpuusers),
-``LD_LIBRARY_PATH`` for CUDA 13 NVRTC, and ``--use_kernels false`` by default.
+BoltzGen extra Docker flags: `--shm-size`, `--group-add` (gpuusers), `LD_LIBRARY_PATH` for CUDA 13 NVRTC, `--use_kernels false` by default. Set `HF_TOKEN` in the environment or repo `.env` for HuggingFace downloads.
+
+Promera mounts `promera.weights_host`, `tinyprot_cache_host`, and `ligandmpnn_dir`. `target_pdb` is for the structure filter only (independent of Promera’s target JSON).
+
+## SoluProt (`proteinmpnn_soluprot_filter`)
+
+After `proteinmpnn_sequences`, SoluProt scores all binder sequences (one combined FASTA per partition) and writes passers to `proteinmpnn/seqs_filtered/`. Boltz-2 and ESMFold read from that directory.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `enabled` | `true` | Set `false` to pass `seqs/` through unchanged |
+| `min_soluble_score` | `0.5` | Keep sequences with SoluProt probability ≥ this |
+| `no_proc` | `1` | Parallel SoluProt workers |
+| `fail_if_all_filtered` | `false` | Ignored by Dagster; empty result → downstream `no_candidates` |
+
+TMHMM is always on (`no_tmhmm` in old YAML is ignored). Build: [`filters/soluprot/build.sh`](../filters/soluprot/build.sh).
+
+## MSA (Boltz-2 only)
+
+The `MSA` asset talks to a ColabFold-style MSA server (`msa.server_url`, default `http://127.0.0.1:18080/api`). The server must be reachable from the Dagster host. ESMFold does not use this step.
+
+## Final scores and Rules A/B/C
+
+Materialize the **`final_scores`** job after predictions. Metrics: [`filters/final_scores/README.md`](../filters/final_scores/README.md).
+
+1. **`final_scores_metrics`** — `{partition}/final_scores/metrics.csv` with `_boltz` / `_esmfold` columns (PyRosetta interface, IPSAE, design-vs-prediction RMSD). Prefers `*_renumbered/`. Sequences with `specificity_hotspots=0` on every model skip expensive Rosetta/IPSAE/RMSD.
+2. **`filtered_designs_export`** — consensus on `specificity_hotspots_* == 2` (configurable):
+   - **Rule A** — a parent design has ≥ `min_parent_successes` (default 5) successful models under one predictor. AF3 JSON keeps **one best sequence per parent**.
+   - **Rule B** — same MPNN sequence succeeds on **both** predictors: (≥2 Boltz and ≥2 ESMFold) **or** (4+ on one and 1+ on the other).
+   - **Rule C** — sequence not already selected; ≥ `min_seq_successes_fallback` (4) successes on one predictor and ≥ `min_good_binder_scores` (2) with `binder_score <= max_binder_score` (0).
+   - Writes `filtered_metrics_rule_ac.csv`, `filtered_metrics_rule_b.csv`, combined `filtered_metrics.csv`, and `for_AF3.json`.
+3. **Rule B track** — stationary glycan superimpose (`hCG_glycans.pdb` onto design β), GlycoSHIELD ensemble clashes (`/storage/hCG/glycans/gs_runs`), LH off-target under `lh_offtarget_b/`, Marp `deck_rule_b`, presentation zip.
+4. **Rule A/C track** — waits for complete AF3 uploads under the partition `AF3/` folder, scores AF3 specificity, then the same glycan / LH / Marp / zip path under `lh_offtarget_ac/` and `{run_id}/rule_ac/`. Partitions without `AF3/` **soft-skip** this track.
+
+Glycan clash: α-Asn52 N-glycan heavy atoms within 2.4 Å of binder (chain A). Ensemble scores are population-weighted across MD clusters.
+
+## Docker images
+
+The pipeline runs tools with `docker run`. Names come from the run-scoped `pipeline_config.yaml`. GPU steps need the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) (`--runtime=nvidia`).
+
+| Image | Used by | Config |
+|---|---|---|
+| `rfdiffusion` | `rfdiffusion_generation` | `rfdiffusion.docker_image` |
+| `boltzgen` | `boltzgen_generation` | `boltzgen.docker_image` |
+| `promera` | `promera_generation` | `promera.docker_image` |
+| `rosettacommons/proteinmpnn` | `proteinmpnn_*` | `proteinmpnn.docker_image` |
+| `soluprot` | `proteinmpnn_soluprot_filter` | `soluprot.docker_image` |
+| `boltz2` | `boltz2_predictions` (+ LH) | `boltz2.docker_image` |
+| `esmfold2` | `esmfold_predictions` (+ LH) | `esmfold.docker_image` |
+| `structure_tools` | `design_structure_filter`, `boltz2_renumber`, `esmfold_renumber` | `structure_filters.structure_docker_image` |
+| `final_scores` | `final_scores_metrics` | `final_scores.docker_image` |
+| `marpteam/marp-cli:v4.1.2` | Rule B / A/C PDF+PPTX | `rule_*_presentation.marp_docker_image` |
+| `alpine` | internal `chown` / `chmod` after container writes | hard-coded in `assets.py` |
+
+`aggregation_filters` is **not** used by the current Dagster jobs. RMSD lives in `final_scores`. Manual NetSolP / protein-sol / Aggrescan3D usage is at the end of this file.
 
 ### Pull from a registry
 
-**ProteinMPNN** — not built in this repo. The pipeline uses the official RosettaCommons
-image ([Docker Hub](https://hub.docker.com/r/rosettacommons/proteinmpnn)) for all three
-`proteinmpnn_*` assets (parse, assign chains, generate sequences). Default tag is
-`latest` (`proteinmpnn.docker_image` in config).
+**ProteinMPNN** — official [RosettaCommons image](https://hub.docker.com/r/rosettacommons/proteinmpnn) (`linux/amd64` only). Sequence generation needs a GPU; parse/assign do not.
 
 ```bash
 docker pull rosettacommons/proteinmpnn:latest
-```
-
-The image is `linux/amd64` only (not ARM). Sequence generation needs a GPU
-(`--runtime=nvidia`); the parse/assign steps do not.
-
-**ESMFold2** and **alpine**:
-
-```bash
-cd /storage/proteindesign/ESMfold2
-docker build -t esmfold2 .
+docker pull marpteam/marp-cli:v4.1.2
 docker pull alpine
 ```
 
-The HuggingFace model cache is mounted from ``esmfold.hf_cache_dir`` (default
-``/storage/proteindesign/ESMfold2/hf_cache``). The first run downloads
-``biohub/ESMFold2`` into that directory. See [ESMfold2/README.md](../ESMfold2/README.md).
-
-**Mount paths:** ESMFold2 uses path-preserving binds (same as design backends): the partition
-root is mounted at its host path, e.g.
-``/storage/hCG/designs/runs/{run_id}/{partition}/`` → mmCIF + sidecars in ``…/esmfold/``.
-``ESMfold2/predict.py`` is mounted read-only from the host.
-
-Use the ESMFold2 tag pinned in `esmfold.docker_image` — do not substitute a
-different tag unless you update `pipeline_config.yaml`.
-
 ### Build local images
 
-Three images are built from this repo (not published to a registry):
-
-**RFdiffusion** — Dockerfile at [`/storage/proteindesign/RFdiffusion/docker/Dockerfile`](../RFdiffusion/docker/Dockerfile):
+**RFdiffusion** — [`RFdiffusion/docker/Dockerfile`](../RFdiffusion/docker/Dockerfile):
 
 ```bash
 cd /storage/proteindesign/RFdiffusion
 docker build -f docker/Dockerfile -t rfdiffusion .
 ```
 
-**BoltzGen** — Dockerfile at [`/storage/proteindesign/boltzgen/Dockerfile`](../boltzgen/Dockerfile):
+**BoltzGen** — [`boltzgen/Dockerfile`](../boltzgen/Dockerfile):
 
 ```bash
 cd /storage/proteindesign/boltzgen
 docker build -t boltzgen .
 ```
 
-Weights download to ``boltzgen.cache_dir`` (default ``/storage/proteindesign/boltzgen/cache``)
-on first run. Export ``HF_TOKEN`` (or put it in the repo ``.env``) to avoid unauthenticated
-HuggingFace rate limits.
+Weights download to `boltzgen.cache_dir` (default `/storage/proteindesign/boltzgen/cache`) on first run. Export `HF_TOKEN` (or put it in the repo `.env`).
 
-**Boltz-2** — Dockerfile at [`/storage/proteindesign/boltz2/Dockerfile`](../boltz2/Dockerfile):
+**Promera** — [`promera/Dockerfile`](../promera/Dockerfile):
+
+```bash
+cd /storage/proteindesign/promera
+docker build -t promera .
+```
+
+Mounts (not baked in): `promera.weights_host` (default `/storage/proteindesign/promera/weights`), `tinyprot_cache_host`, `ligandmpnn_dir`. See [`promera/README.md`](../promera/README.md).
+
+**Boltz-2** — [`boltz2/Dockerfile`](../boltz2/Dockerfile):
 
 ```bash
 cd /storage/proteindesign/boltz2
 docker build -t boltz2 .
 ```
 
-The pipeline uses a named Docker volume `boltz2-cache` (see `boltz2.cache_volume` in
-config). Docker creates it on first use; no manual step is required.
+Named volume `boltz2-cache` (`boltz2.cache_volume`) is created on first use.
 
-**aggregation_filters** — Dockerfile at [`/storage/proteindesign/filters/aggregation/Dockerfile`](../filters/aggregation/Dockerfile).
-See [`/storage/proteindesign/filters/aggregation/README.md`](../filters/aggregation/README.md) for details.
+**ESMFold2:**
 
-(Place extracted NetSolP model files in the build context:
+```bash
+cd /storage/proteindesign/ESMfold2
+docker build -t esmfold2 .
+```
+
+HuggingFace cache: `esmfold.hf_cache_dir` (default `/storage/proteindesign/ESMfold2/hf_cache`). First run downloads `biohub/ESMFold2`. See [ESMfold2/README.md](../ESMfold2/README.md). Path-preserving binds: partition root is mounted at its host path; `ESMfold2/predict.py` is mounted read-only.
+
+**structure_tools** — [`filters/structure/README.md`](../filters/structure/README.md):
+
+```bash
+docker build -f structure/Dockerfile -t structure_tools /storage/proteindesign/filters
+```
+
+**final_scores** — [`filters/final_scores/README.md`](../filters/final_scores/README.md):
+
+```bash
+docker build -f filters/final_scores/Dockerfile -t final_scores /storage/proteindesign
+```
+
+**soluprot:** [`filters/soluprot/build.sh`](../filters/soluprot/build.sh).
+
+### Host paths (not images)
+
+- **RFdiffusion models** — `rfdiffusion.rfdiffusion_models_host` (default `/storage/proteindesign/RFdiffusion/models`)
+- **ESMFold2 HuggingFace cache** — `esmfold.hf_cache_dir`
+- **BoltzGen cache** — under the boltzgen repo `cache/` directory
+- **Promera weights / tinyprot cache / LigandMPNN** — `promera.*`
+- **IPSAE script** — `final_scores.ipsae_script` (default `/storage/shaburova/antibodies/IPSAE/ipsae.py`)
+- **Glycans** — `/storage/hCG/hCG_glycans.pdb` and GlycoSHIELD caches under `/storage/hCG/glycans/gs_runs`
+- **PyMOL** — `rule_*_presentation.pymol` on the host
+
+### Verify images
+
+```bash
+docker images --format '{{.Repository}}:{{.Tag}}' \
+  | grep -E '^(rfdiffusion|boltzgen|promera|boltz2|esmfold2|structure_tools|final_scores|soluprot|rosettacommons/proteinmpnn|marpteam/marp-cli|alpine)'
+```
+
+### Load / save (offline hosts)
+
+There is no checked-in image tarball. Copy with `docker save` / `docker load`; tags must match `pipeline_config.yaml`.
+
+---
+
+## Standalone aggregation image (`aggregation_filters`)
+
+Not part of the Dagster jobs. Image: [`filters/aggregation/Dockerfile`](../filters/aggregation/Dockerfile). Details: [`filters/aggregation/README.md`](../filters/aggregation/README.md).
+
+Place extracted NetSolP models in the build context:
 
 ```text
 /storage/proteindesign/filters/aggregation/models/*.onnx
 /storage/proteindesign/filters/aggregation/models/*.pkl
 ```
-)
-
-Build from `filters/` (tag must match `filters.docker_image` in `pipeline_config.yaml`):
 
 ```bash
 docker build -f aggregation/Dockerfile -t aggregation_filters /storage/proteindesign/filters
 ```
 
-#### Using aggregation tools manually (`aggregation_filters`)
-
-The image ships **NetSolP**, **protein-sol**, and **Aggrescan3D** only.
-SoluProt is a separate image — see [`/storage/proteindesign/filters/soluprot/README.md`](../filters/soluprot/README.md).
-
-All examples mount a host directory at `/workspace` inside the container. Adjust
-paths as needed.
+The image ships **NetSolP**, **protein-sol**, and **Aggrescan3D**. SoluProt is a separate image.
 
 ```bash
 export AGGREGATION_FILTERS_IMAGE=aggregation_filters
-export WORK=/storage/proteindesign/my_filter_run   # your inputs + outputs
+export WORK=/storage/proteindesign/my_filter_run
 mkdir -p "$WORK"
 ```
-
-General pattern:
 
 ```bash
 docker run --rm -v "$WORK:/workspace" "$AGGREGATION_FILTERS_IMAGE" <command> ...
 ```
-
-**Batching vs parallelization**
 
 | Tool | Input | Multiple designs in one run? | In-tool parallelism | Scale out |
 |------|--------|-------------------------------|---------------------|-----------|
 | NetSolP | FASTA | Yes — many `>seq` records in one file | `--NUM_THREADS` (PyTorch) | Split FASTA + multiple `docker run`, or raise threads |
 | protein-sol | FASTA | Yes — many sequences in one file | No (sequential Perl) | Split FASTA or one container per file |
 | SoluProt | FASTA | Yes — many sequences in one file | `--no_proc N` (TMHMM + USEARCH) | Split FASTA or multiple containers |
-| Aggrescan3D | PDB | No — one structure per invocation | No | One `docker run` per PDB (e.g. GNU parallel, Dagster) |
+| Aggrescan3D | PDB | No — one structure per invocation | No | One `docker run` per PDB |
 
----
-
-**NetSolP** (`netsolp`) — sequence solubility / usability (requires models baked into the image).
+**NetSolP** (`netsolp`):
 
 ```bash
-# Single FASTA, many sequences; CSV output
-docker run --rm -v "$WORK:/workspace" "$AGGREGATION_FILTERS_IMAGE" \
-  netsolp \
-    --FASTA_PATH /workspace/sequences.fasta \
-    --OUTPUT_PATH /workspace/netsolp_preds.csv \
-    --MODEL_TYPE Distilled \
-    --PREDICTION_TYPE S
-
-# Faster on CPU: more PyTorch threads (default is low)
 docker run --rm -v "$WORK:/workspace" "$AGGREGATION_FILTERS_IMAGE" \
   netsolp \
     --FASTA_PATH /workspace/sequences.fasta \
@@ -228,33 +326,16 @@ docker run --rm -v "$WORK:/workspace" "$AGGREGATION_FILTERS_IMAGE" \
 ```
 
 - `--PREDICTION_TYPE`: `S` (solubility), `U` (usability), `SU` (both).
-- `--MODEL_TYPE`: `Distilled` (fast), `ESM12`, `ESM1b`, or `Both` (slowest, averages).
+- `--MODEL_TYPE`: `Distilled` (fast), `ESM12`, `ESM1b`, or `Both`.
 
----
-
-**protein-sol** (`protein-sol`) — sequence solubility (Manchester server model).
-
-```bash
-docker run --rm -v "$WORK:/workspace" "$AGGREGATION_FILTERS_IMAGE" \
-  protein-sol /workspace/sequences.fasta
-```
-
-Output is written under the tool install dir inside the image, not next to your
-input. Copy results out after the run:
+**protein-sol** — output is under the tool install dir inside the image; copy it out:
 
 ```bash
 docker run --rm -v "$WORK:/workspace" "$AGGREGATION_FILTERS_IMAGE" bash -c \
   'protein-sol /workspace/sequences.fasta && cp /opt/tools/protein-sol/protein-sol-sequence-prediction-software/seq_prediction.txt /workspace/protein_sol_seq_prediction.txt'
 ```
 
-The wrapper copies your FASTA to a temp file so the original on the host is not
-rewritten. One FASTA can contain many sequences; they are processed in one batch
-with no multi-core option inside the tool.
-
----
-
-**SoluProt** (`soluprot`) — sequence solubility with TMHMM. Separate image; build with
-[`filters/soluprot/build.sh`](../filters/soluprot/build.sh).
+**SoluProt** (separate image):
 
 ```bash
 export SOLUPROT_IMAGE=soluprot
@@ -264,23 +345,11 @@ docker run --rm -v "$WORK:/workspace" "$SOLUPROT_IMAGE" \
   soluprot \
     --i_fa /workspace/sequences.fasta \
     --o_csv /workspace/soluprot_preds.csv \
-    --tmp_dir /workspace/soluprot_tmp
-
-# Optional: parallel workers
-docker run --rm -v "$WORK:/workspace" "$SOLUPROT_IMAGE" \
-  soluprot \
-    --i_fa /workspace/sequences.fasta \
-    --o_csv /workspace/soluprot_preds.csv \
     --tmp_dir /workspace/soluprot_tmp \
     --no_proc 4
 ```
 
-TMHMM is enabled by default. Pass `--no_tmhmm` only if you want the slightly less
-accurate model without transmembrane features.
-
----
-
-**Aggrescan3D** (`aggrescan`) — structure aggregation propensity (PDB in, scores + plots out).
+**Aggrescan3D** (`aggrescan`):
 
 ```bash
 mkdir -p "$WORK/aggrescan_out"
@@ -297,112 +366,17 @@ docker run --rm -v "$WORK:/workspace" "$AGGREGATION_FILTERS_IMAGE" \
 - `-C A` — restrict to chain `A` (optional).
 - Outputs: `output.pdb` (B-factors = scores), `A3D.csv`, `A.png` / `B.png` per chain.
 
-One PDB per command. To score many structures in parallel on the host:
-
 ```bash
 find "$WORK/pdbs" -name '*.pdb' | parallel -j 4 \
   'docker run --rm -v "$WORK:/workspace" '"$AGGREGATION_FILTERS_IMAGE"' \
     aggrescan -i /workspace/pdbs/{/} -w /workspace/aggrescan_{/%.pdb} -v 2 -O'
 ```
 
-(Requires [GNU parallel](https://www.gnu.org/software/parallel/); adjust `-j` to CPU count.)
+FoldX, CABS-flex, and dynamic modes are not installed.
 
-Example with a repo test structure:
-
-```bash
-docker run --rm -v /storage/proteindesign:/workspace "$AGGREGATION_FILTERS_IMAGE" \
-  aggrescan -i /workspace/5I0Z.pdb -w /workspace/aggrescan_5I0Z -v 4 -O
-```
-
-FoldX, CABS-flex, and dynamic modes are not installed in this image.
-
----
-
-**Smoke test** (BioPython + PyRosetta in the image):
+**Smoke test:**
 
 ```bash
 docker run --rm "$AGGREGATION_FILTERS_IMAGE" \
   python -c "import Bio; import pyrosetta; print('BioPython:', Bio.__version__); print('PyRosetta OK')"
 ```
-
-### Host paths mounted at run time
-
-These are not Docker images, but the pipeline expects them to exist:
-
-- **RFdiffusion models** — `rfdiffusion.rfdiffusion_models_host` (default
-  `/storage/proteindesign/RFdiffusion/models`)
-- **ESMFold2 HuggingFace cache** — ``esmfold.hf_cache_dir`` (default
-  ``/storage/proteindesign/ESMfold2/hf_cache``)
-- **RMSD script (host only)** — `filters.scripts_host_dir` (default
-  `/storage/proteindesign/filters/rmsd`; not baked into `aggregation_filters`)
-
-#### Backbone RMSD (Dagster only — not in the image)
- TODO
-
-### Verify images are present
-
-```bash
-docker images --format '{{.Repository}}:{{.Tag}}' \
-  | grep -E '^(rfdiffusion|boltz2|esmfold2|aggregation_filters|rosettacommons/proteinmpnn|alpine)'
-```
-
-### Load / save (offline or air-gapped hosts)
-
-There is no checked-in image tarball in this repo. To copy images from a machine
-that already has them:
-
-```bash
-# On the source machine (example: rfdiffusion)
-docker save rfdiffusion:latest | gzip > rfdiffusion.tar.gz
-
-# On the target machine
-docker load < rfdiffusion.tar.gz
-```
-
-Repeat for `boltz2`, `aggregation_filters`, `rosettacommons/proteinmpnn:latest`,
-`esmfold2`, and `alpine`.
-After loading, image names/tags must match those in `pipeline_config.yaml`.
-
-## Start UI (SSH tunnel)
-
-**On the server:**
-```bash
-mamba activate proteindesign-dagster
-cd /storage/proteindesign/dagster_pipeline
-dagster dev -h 0.0.0.0 -p 3000 -m dagster_pipeline.definitions
-```
-
-**On your laptop:**
-```bash
-ssh -L 3000:127.0.0.1:3000 USER@SERVER
-```
-
-Then open **http://127.0.0.1:3000** in a browser.
-
-## Running the pipeline
-
-1. **Generate configs** (first time, or after changing designs/hotspots): Launchpad →
-   `generate_configs` job → Launch
-2. **Full run**: Launchpad → `design_pipeline` job → select partition(s) → Launch
-3. **Partial re-run** (e.g. changed ProteinMPNN params): Asset Catalog → select
-   `proteinmpnn_sequences` and everything downstream → **Materialize selected**
-   (update config in the dialog if needed)
-
-## Launchpad config (key params you'll change often)
-
-| Scope | Config field | Default |
-|---|---|---|
-| Resource `paths.epitopes_hotspots` | `designs_config` | `designs_1`, `designs_2` |
-| `rfdiffusion_backbones` | `outputs_dir`, `gpus`, `extra_hydra_args` | `/storage/hCG/rfdiffusion/outputs`, `1,2`, `[]` |
-| `proteinmpnn_parsed` | `docker_image` | `rosettacommons/proteinmpnn` |
-| `proteinmpnn_parsed` | `docker_image`, `chain_list` | `rosettacommons/proteinmpnn`, `"A"`; BoltzGen also writes `fixed_positions.jsonl` from `binder_sequence_file` |
-| `proteinmpnn_sequences` | `docker_image`, `num_seq_per_target`, `sampling_temp`, `use_soluble_model`, `omit_AA` | `rosettacommons/proteinmpnn`, 10 / 0.1 / false; per-scaffold `omit_AA` (e.g. `affimer: C`) merged into `omit_AAs` when the name matches; passes `--fixed_positions_jsonl` when present |
-| `esmfold_input_jsons` | `target_fasta` (defaults to `boltz2.target_fasta`) | loops_epitope_target.fasta |
-| `esmfold_predictions` | `docker_image`, `num_loops`, `query_chunk_size`, `gpus` | esmfold2 / 20 / 10 |
-| `boltz2_renumber` / `esmfold_renumber` | `boltz2.renumber_outputs` / `esmfold.renumber_outputs`; image from `structure_filters.structure_docker_image` | true / true |
-
-Named design inputs are in `paths.epitopes_hotspots.designs_config`. Partition
-outputs and `design_configs_manifest.json` are under
-`rfdiffusion_backbones.config.outputs_dir`. Asset-specific mounts live with each
-asset config (`rfdiffusion_models_host` in `rfdiffusion_backbones`, and
-`esmfold.hf_cache_dir` for the ESMFold2 HuggingFace model cache).
